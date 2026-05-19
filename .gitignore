@@ -1,0 +1,51 @@
+# Local secrets and machine-specific environment.
+.env
+.env.*
+!.env.example
+
+# Python cache/build artifacts.
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+*.egg-info/
+
+# Experiment outputs and logs.
+outputs/
+wandb/
+logs/
+runs/
+checkpoints/
+checkpoint-*/
+checkpoint-last/
+
+# Large model/checkpoint artifacts.
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Local datasets/caches.
+data/
+datasets/
+cache/
+.cache/
+hf-cache/
+
+# Generated media.
+*.mp4
+*.avi
+*.mov
+*.webm
+
+# Editor/OS noise.
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~

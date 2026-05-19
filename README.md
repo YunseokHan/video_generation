@@ -45,7 +45,13 @@ Training flattens this to image-like samples, repeats each caption across that v
 
 ## Environment And W&B
 
-Experiment environment variables are managed through [.env](/NHNHOME/WORKSPACE/26moe001_D/yunseok/video_generation/.env). Fill in `HF_TOKEN` for gated Hugging Face access and `WANDB_API_KEY` for online W&B logging. The default file sets `WANDB_MODE=offline` so a dry run can log locally without a key; switch it to `online` after adding the key.
+Experiment environment variables are managed through a local `.env` file, which is intentionally gitignored. Start from [.env.example](/NHNHOME/WORKSPACE/26moe001_D/yunseok/video_generation/.env.example):
+
+```bash
+cp .env.example .env
+```
+
+Fill in `HF_TOKEN` for gated Hugging Face access and `WANDB_API_KEY` for online W&B logging. The default template sets `WANDB_MODE=offline` so a dry run can log locally without a key; switch it to `online` after adding the key.
 
 W&B logging is controlled by `logging:` in [configs/default.yaml](/NHNHOME/WORKSPACE/26moe001_D/yunseok/video_generation/configs/default.yaml). Logged metrics include loss, learning rate, global step, estimated frames seen, GPU max memory, parameter counts, checkpoint events, validation frame counts, and validation grid/video media.
 
