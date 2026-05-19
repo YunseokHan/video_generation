@@ -1,0 +1,9 @@
+accelerate
+diffusers
+transformers
+torch
+Pillow
+PyYAML
+imageio
+wandb
+python-dotenv

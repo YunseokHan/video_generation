@@ -1,0 +1,95 @@
+model:
+  pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
+  dtype: "bf16"
+  resolution: 1024
+
+data:
+  dataset_type: "placeholder"
+  num_frames_per_video: 8
+  placeholder_num_videos: 100
+  placeholder_caption: "A simple placeholder video caption"
+  placeholder_image_dir: null
+  frame_sampling: "uniform"
+  num_workers: 0
+
+temporal_conditioning:
+  type: "mlp"
+  injection_mode: "add_to_pooled_prompt_embeds"
+  normalize_positions: true
+  output_dim: null
+  hidden_dim: 1024
+  num_layers: 2
+  alpha: 1.0
+
+video_adapters:
+  frame_position_encoder:
+    enabled: false
+    type: "sinusoidal"
+    train: true
+    embedding_dim: 2048
+    hidden_dim: 1024
+    num_layers: 2
+    num_tokens: 1
+    pooling: "mean"
+  resnet:
+    enabled: false
+    active: true
+    train: true
+    frame_embedding_dim: 2048
+    use_temporal_conv1: true
+    use_temporal_conv2: true
+    use_frame_conditioning: true
+  attention:
+    enabled: false
+    active: true
+    train: true
+    use_temporal_self_attention: true
+    use_temporal_cross_attention: true
+    include_prompt_tokens: true
+
+training:
+  output_dir: "outputs/sdxl_frame_generator"
+  train_batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-5
+  max_train_steps: 1000
+  mixed_precision: "bf16"
+  train_temporal_embedding: true
+  train_unet: true
+  train_text_encoder: false
+  train_vae: false
+  checkpointing_steps: 500
+  validation_steps: 100
+  logging_steps: 10
+  seed: 42
+
+logging:
+  report_to: "wandb"
+  project: "sdxl-frame-generator"
+  entity: null
+  run_name: null
+  group: null
+  job_type: "train"
+  tags: ["sdxl", "frame-generator", "temporal-mlp"]
+  notes: null
+  log_validation_media: true
+  wandb_watch: false
+  wandb_watch_log: "gradients"
+  wandb_watch_log_freq: 100
+
+optimizer:
+  type: "adamw"
+  weight_decay: 1.0e-2
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+validation:
+  enabled: true
+  prompt: "A dog running through a grassy field, cinematic lighting"
+  num_frames: 8
+  output_dir: "validation"
+  save_grid: true
+  save_mp4: true
+  num_inference_steps: 30
+  guidance_scale: 7.5
+  batch_size: null
