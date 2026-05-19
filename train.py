@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -32,7 +32,12 @@ from framegen.sdxl import (
     encode_prompts_with_sdxl_logic,
     validate_sdxl_added_conditioning_dimensions,
 )
-from framegen.temporal import FramePositionMLP, build_frame_position_encoder
+from framegen.temporal import (
+    FramePositionMLP,
+    apply_frame_token_conditioning,
+    build_frame_position_encoder,
+    normalize_frame_token_mode,
+)
 from framegen.utils import count_trainable_and_frozen, format_param_count, set_requires_grad
 from framegen.video_attention import (
     VideoAttentionAdapterConfig,
@@ -56,7 +61,7 @@ from framegen.video_resnet import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train an SDXL frame-position-conditioned generator.")
-    parser.add_argument("--config", default="configs/default.yaml", help="Path to the YAML config file.")
+    parser.add_argument("--config", default="configs/train/default.yaml", help="Path to the YAML config file.")
     parser.add_argument("--env_file", default=".env", help="Path to an environment-variable file.")
     return parser.parse_args()
 
@@ -154,6 +159,11 @@ def get_report_to(config: dict) -> str | None:
     return str(config.get("logging", {}).get("report_to", "wandb"))
 
 
+def wandb_is_enabled(config: dict) -> bool:
+    report_to = str(config.get("logging", {}).get("report_to", "")).lower()
+    return tracker_is_enabled(config) and "wandb" in {item.strip() for item in report_to.split(",")}
+
+
 def init_experiment_trackers(
     accelerator: Accelerator,
     config: dict,
@@ -180,7 +190,7 @@ def init_experiment_trackers(
         ("notes", "notes"),
     ]:
         value = logging_config.get(config_key)
-        if value is not None:
+        if value is not None and value != "":
             wandb_kwargs[wandb_key] = value
 
     tracker_config = {
@@ -236,27 +246,182 @@ def log_validation_media(
     validation_dir: Path,
     global_step: int,
 ) -> None:
-    if not tracker_is_enabled(config):
-        return
     if not config.get("logging", {}).get("log_validation_media", True):
+        return
+    log_media_directory(
+        accelerator=accelerator,
+        config=config,
+        media_dir=validation_dir,
+        global_step=global_step,
+        prefix="validation",
+    )
+
+
+def log_media_directory(
+    accelerator: Accelerator,
+    config: dict,
+    media_dir: Path,
+    global_step: int,
+    prefix: str,
+    caption: str | None = None,
+    fps: int = 8,
+) -> None:
+    if not wandb_is_enabled(config):
         return
     if not accelerator.is_main_process:
         return
     try:
         import wandb
     except ImportError:
-        accelerator.print("wandb is not installed; skipped validation media logging.")
+        accelerator.print(f"wandb is not installed; skipped {prefix} media logging.")
         return
 
     payload = {}
-    grid_path = validation_dir / "grid.png"
-    video_path = validation_dir / "video.mp4"
+    media_dir = Path(media_dir)
+    grid_path = media_dir / "grid.png"
+    video_path = media_dir / "video.mp4"
     if grid_path.exists():
-        payload["validation/grid"] = wandb.Image(str(grid_path), caption=f"step {global_step}")
+        payload[f"{prefix}/grid"] = wandb.Image(
+            str(grid_path),
+            caption=caption or f"step {global_step}",
+        )
     if video_path.exists():
-        payload["validation/video"] = wandb.Video(str(video_path), fps=8, format="mp4")
+        payload[f"{prefix}/video"] = wandb.Video(
+            str(video_path),
+            fps=fps,
+            format="mp4",
+            caption=caption,
+        )
     if payload:
         accelerator.log(payload, step=global_step)
+
+
+def _set_eval_temporarily(*modules) -> list[tuple[torch.nn.Module, bool]]:
+    states = []
+    for module in modules:
+        if module is None:
+            continue
+        states.append((module, bool(module.training)))
+        module.eval()
+    return states
+
+
+def _restore_training_states(states: list[tuple[torch.nn.Module, bool]]) -> None:
+    for module, was_training in states:
+        module.train(was_training)
+
+
+def should_log_training_caption_inference(config: dict, global_step: int) -> bool:
+    if not wandb_is_enabled(config):
+        return False
+    logging_config = config.get("logging", {})
+    if not logging_config.get("log_training_caption_inference", False):
+        return False
+    interval = int(logging_config.get("training_caption_inference_steps", 0) or 0)
+    return interval > 0 and global_step > 0 and global_step % interval == 0
+
+
+def log_training_caption_inference(
+    accelerator: Accelerator,
+    config: dict,
+    pipe,
+    unet,
+    vae,
+    text_encoder,
+    text_encoder_2,
+    temporal_mlp,
+    frame_position_encoder,
+    prompt: str,
+    global_step: int,
+    output_dir: Path,
+    resolution: int,
+    temporal_alpha: float,
+    injection_mode: str,
+    frame_encoder_config: dict,
+) -> None:
+    if not accelerator.is_main_process:
+        return
+
+    logging_config = config.get("logging", {})
+    media_root = output_dir / (
+        logging_config.get("training_caption_output_dir")
+        or logging_config.get("training_caption_inference_output_dir")
+        or "training_caption_samples"
+    )
+    media_dir = media_root / f"step_{global_step:04d}"
+    num_frames = int(
+        logging_config.get(
+            "training_caption_num_frames",
+            config.get("data", {}).get("num_frames_per_video", 8),
+        )
+    )
+    seed = logging_config.get("training_caption_seed")
+    if seed is None and config.get("training", {}).get("seed") is not None:
+        seed = int(config["training"]["seed"]) + int(global_step)
+    generation_resolution = logging_config.get("training_caption_resolution") or resolution
+
+    unwrapped_unet = accelerator.unwrap_model(unet)
+    unwrapped_vae = accelerator.unwrap_model(vae)
+    unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
+    unwrapped_text_encoder_2 = accelerator.unwrap_model(text_encoder_2)
+    unwrapped_temporal_mlp = accelerator.unwrap_model(temporal_mlp)
+    unwrapped_frame_position_encoder = (
+        accelerator.unwrap_model(frame_position_encoder)
+        if frame_position_encoder is not None
+        else None
+    )
+
+    module_states = _set_eval_temporarily(
+        unwrapped_unet,
+        unwrapped_vae,
+        unwrapped_text_encoder,
+        unwrapped_text_encoder_2,
+        unwrapped_temporal_mlp,
+        unwrapped_frame_position_encoder,
+    )
+    try:
+        pipe.unet = unwrapped_unet
+        pipe.vae = unwrapped_vae
+        pipe.text_encoder = unwrapped_text_encoder
+        pipe.text_encoder_2 = unwrapped_text_encoder_2
+        pipe.to(accelerator.device)
+        generate_video_frames(
+            pipe=pipe,
+            temporal_mlp=unwrapped_temporal_mlp,
+            frame_position_encoder=unwrapped_frame_position_encoder,
+            prompt=prompt,
+            num_frames=num_frames,
+            output_dir=media_dir,
+            resolution=int(generation_resolution),
+            temporal_alpha=temporal_alpha,
+            injection_mode=injection_mode,
+            frame_token_embedding_mode=frame_encoder_config["token_embedding_mode"],
+            frame_token_alpha=float(frame_encoder_config.get("alpha", 1.0)),
+            num_inference_steps=int(logging_config.get("training_caption_num_inference_steps", 20)),
+            guidance_scale=float(logging_config.get("training_caption_guidance_scale", 7.5)),
+            seed=seed,
+            batch_size=logging_config.get("training_caption_batch_size"),
+            save_grid=bool(logging_config.get("training_caption_save_grid", True)),
+            save_video=bool(logging_config.get("training_caption_save_mp4", False)),
+        )
+        log_media_directory(
+            accelerator=accelerator,
+            config=config,
+            media_dir=media_dir,
+            global_step=global_step,
+            prefix="train_caption",
+            caption=prompt,
+            fps=int(logging_config.get("training_caption_fps", 8)),
+        )
+        accelerator.log(
+            {
+                "train_caption/generated_frames": num_frames,
+                "train_caption/prompt_length": len(prompt),
+            },
+            step=global_step,
+        )
+    finally:
+        _restore_training_states(module_states)
 
 
 def get_gpu_memory_mb() -> float | None:
@@ -274,8 +439,10 @@ def log_first_step_shapes(accelerator: Accelerator, shapes: dict[str, object]) -
 def main() -> None:
     args = parse_args()
     config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = PROJECT_ROOT / config_path
     config = load_config(config_path)
-    project_root = config_path.resolve().parent.parent if config_path.parent.name == "configs" else Path.cwd()
+    project_root = PROJECT_ROOT
     env_file = Path(args.env_file)
     if not env_file.is_absolute():
         env_file = project_root / env_file
@@ -294,13 +461,25 @@ def main() -> None:
     frame_encoder_config.setdefault("num_layers", 2)
     frame_encoder_config.setdefault("num_tokens", 1)
     frame_encoder_config.setdefault("pooling", "mean")
+    frame_encoder_config.setdefault("token_embedding_mode", "add_to_text")
+    frame_encoder_config.setdefault("alpha", 1.0)
+    frame_encoder_config["token_embedding_mode"] = normalize_frame_token_mode(
+        frame_encoder_config["token_embedding_mode"]
+    )
     video_adapter_config["frame_position_encoder"] = frame_encoder_config
     video_resnet_config = VideoResnetAdapterConfig.from_config(
         video_adapter_config.get("resnet")
     )
+    vae_decoder_resnet_config = VideoResnetAdapterConfig.from_config(
+        video_adapter_config.get("vae_decoder_resnet")
+    )
     if frame_encoder_config["enabled"]:
         video_resnet_config.frame_embedding_dim = int(frame_encoder_config["embedding_dim"])
+        vae_decoder_resnet_config.frame_embedding_dim = int(frame_encoder_config["embedding_dim"])
         video_adapter_config.setdefault("resnet", {})["frame_embedding_dim"] = int(
+            frame_encoder_config["embedding_dim"]
+        )
+        video_adapter_config.setdefault("vae_decoder_resnet", {})["frame_embedding_dim"] = int(
             frame_encoder_config["embedding_dim"]
         )
     video_attention_config = VideoAttentionAdapterConfig.from_config(
@@ -329,16 +508,25 @@ def main() -> None:
     text_encoder_2 = pipe.text_encoder_2
     vae = pipe.vae
     unet = pipe.unet
+    vae_decoder = getattr(vae, "decoder", vae)
     video_resnet_blocks = inject_video_resnet_adapters(unet, video_resnet_config)
+    vae_decoder_resnet_blocks = inject_video_resnet_adapters(
+        vae_decoder,
+        vae_decoder_resnet_config,
+    )
     video_attention_blocks = inject_video_attention_adapters(unet, video_attention_config)
     sync_video_resnet_adapter_device_dtype(unet)
+    sync_video_resnet_adapter_device_dtype(vae_decoder)
     sync_video_attention_adapter_device_dtype(unet)
 
     noise_scheduler = load_noise_scheduler(model_config)
 
     train_temporal_embedding = bool(training_config.get("train_temporal_embedding", True))
-    train_unet = bool(training_config.get("train_unet", True))
+    train_unet = bool(training_config.get("train_unet", False))
     train_video_resnet_adapters = video_resnet_config.enabled and video_resnet_config.train
+    train_vae_decoder_resnet_adapters = (
+        vae_decoder_resnet_config.enabled and vae_decoder_resnet_config.train
+    )
     train_video_attention_adapters = video_attention_config.enabled and video_attention_config.train
     train_frame_position_encoder = bool(
         frame_encoder_config["enabled"] and frame_encoder_config.get("train", True)
@@ -356,6 +544,9 @@ def main() -> None:
     set_requires_grad(text_encoder, train_text_encoder)
     set_requires_grad(text_encoder_2, train_text_encoder)
     set_requires_grad(vae, train_vae)
+    if vae_decoder_resnet_config.enabled:
+        set_video_resnet_adapter_requires_grad(vae_decoder, train_vae_decoder_resnet_adapters)
+        set_video_resnet_adapters_active(vae_decoder, vae_decoder_resnet_config.active)
 
     if train_unet or train_video_resnet_adapters or train_video_attention_adapters:
         unet.train()
@@ -417,7 +608,10 @@ def main() -> None:
     if not train_temporal_embedding:
         temporal_mlp.to(device=device, dtype=torch_dtype)
     if frame_position_encoder is not None and not train_frame_position_encoder:
-        frame_position_encoder.to(device=device, dtype=torch_dtype)
+        if any(True for _ in frame_position_encoder.parameters()):
+            frame_position_encoder.to(device=device, dtype=torch_dtype)
+        else:
+            frame_position_encoder.to(device=device)
 
     trainable_count, frozen_count = count_trainable_and_frozen(
         [unet, vae, text_encoder, text_encoder_2, temporal_mlp, frame_position_encoder]
@@ -430,6 +624,12 @@ def main() -> None:
         f"frame_embedding_dim={video_resnet_config.frame_embedding_dim}"
     )
     accelerator.print(
+        "  vae decoder resnet adapters: "
+        f"enabled={vae_decoder_resnet_config.enabled}, active={vae_decoder_resnet_config.active}, "
+        f"train={train_vae_decoder_resnet_adapters}, blocks={vae_decoder_resnet_blocks}, "
+        f"frame_embedding_dim={vae_decoder_resnet_config.frame_embedding_dim}"
+    )
+    accelerator.print(
         "  video attention adapters: "
         f"enabled={video_attention_config.enabled}, active={video_attention_config.active}, "
         f"train={train_video_attention_adapters}, blocks={video_attention_blocks}"
@@ -438,7 +638,9 @@ def main() -> None:
         "  frame position encoder: "
         f"enabled={frame_encoder_config['enabled']}, train={train_frame_position_encoder}, "
         f"type={frame_encoder_config['type']}, tokens={frame_encoder_config['num_tokens']}, "
-        f"dim={frame_encoder_config['embedding_dim']}"
+        f"dim={frame_encoder_config['embedding_dim']}, "
+        f"token_mode={frame_encoder_config['token_embedding_mode']}, "
+        f"alpha={frame_encoder_config['alpha']}"
     )
     init_experiment_trackers(
         accelerator=accelerator,
@@ -458,14 +660,21 @@ def main() -> None:
         )
 
     dataset = build_dataset(config)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=int(training_config["train_batch_size"]),
-        shuffle=True,
-        num_workers=int(config["data"].get("num_workers", 0)),
-        collate_fn=video_collate_fn,
-        drop_last=True,
-    )
+    data_config = config["data"]
+    dataloader_num_workers = int(data_config.get("num_workers", 0))
+    dataloader_pin_memory = bool(data_config.get("pin_memory", torch.cuda.is_available()))
+    dataloader_kwargs = {
+        "batch_size": int(training_config["train_batch_size"]),
+        "shuffle": True,
+        "num_workers": dataloader_num_workers,
+        "collate_fn": video_collate_fn,
+        "drop_last": True,
+        "pin_memory": dataloader_pin_memory,
+    }
+    if dataloader_num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = bool(data_config.get("persistent_workers", True))
+        dataloader_kwargs["prefetch_factor"] = int(data_config.get("prefetch_factor", 2))
+    dataloader = DataLoader(dataset, **dataloader_kwargs)
 
     parameters = [
         parameter
@@ -488,7 +697,7 @@ def main() -> None:
         named_models.append(("frame_position_encoder", frame_position_encoder))
     if train_text_encoder:
         named_models.extend([("text_encoder", text_encoder), ("text_encoder_2", text_encoder_2)])
-    if train_vae:
+    if train_vae or train_vae_decoder_resnet_adapters:
         named_models.append(("vae", vae))
 
     prepared_models, optimizer, dataloader = prepare_trainable_models(
@@ -525,19 +734,18 @@ def main() -> None:
     while global_step < max_train_steps:
         for batch in dataloader:
             with accelerator.accumulate(*accumulation_models):
-                frames = batch["frames"].to(device=accelerator.device, dtype=torch_dtype)
-                frame_positions = batch["frame_positions"].to(device=accelerator.device)
-                frames_flat, captions_flat, frame_positions_flat = flatten_video_batch(
-                    {
-                        "frames": frames,
-                        "captions": batch["captions"],
-                        "frame_positions": frame_positions,
-                    }
+                frames = batch["frames"].to(
+                    device=accelerator.device,
+                    dtype=torch_dtype,
+                    non_blocking=dataloader_pin_memory,
                 )
-                frame_positions_flat = frame_positions_flat.to(device=accelerator.device)
-
-                assert len(captions_flat) == frames_flat.shape[0]
-                assert frame_positions_flat.shape[0] == frames_flat.shape[0]
+                frame_positions = batch["frame_positions"].to(
+                    device=accelerator.device,
+                    non_blocking=dataloader_pin_memory,
+                )
+                batch_size, num_frames = frames.shape[:2]
+                frames_flat = frames.flatten(0, 1)
+                frame_positions_flat = frame_positions.flatten(0, 1)
 
                 vae_context = contextlib.nullcontext() if train_vae else torch.no_grad()
                 with vae_context:
@@ -555,8 +763,13 @@ def main() -> None:
 
                 text_context = contextlib.nullcontext() if train_text_encoder else torch.no_grad()
                 with text_context:
+                    captions_for_text = (
+                        [caption for caption in batch["captions"] for _ in range(num_frames)]
+                        if train_text_encoder
+                        else batch["captions"]
+                    )
                     prompt_embeds, pooled_prompt_embeds = encode_prompts_with_sdxl_logic(
-                        captions_flat,
+                        captions_for_text,
                         tokenizer=tokenizer,
                         tokenizer_2=tokenizer_2,
                         text_encoder=text_encoder,
@@ -564,6 +777,9 @@ def main() -> None:
                         device=accelerator.device,
                         dtype=torch_dtype,
                     )
+                    if not train_text_encoder:
+                        prompt_embeds = prompt_embeds.repeat_interleave(num_frames, dim=0)
+                        pooled_prompt_embeds = pooled_prompt_embeds.repeat_interleave(num_frames, dim=0)
 
                 modified_pooled_prompt_embeds, frame_embeds = (
                     add_temporal_embedding_to_pooled_prompt_embeds(
@@ -587,9 +803,18 @@ def main() -> None:
                 assert modified_pooled_prompt_embeds.shape == pooled_prompt_embeds.shape
                 frame_adapter_pooled_flat = None
                 frame_adapter_tokens = None
+                frame_attention_tokens = None
                 if frame_position_encoder is not None:
                     frame_adapter_pooled, frame_adapter_tokens = frame_position_encoder(frame_positions)
                     frame_adapter_pooled_flat = frame_adapter_pooled.reshape(frames_flat.shape[0], -1)
+                    prompt_embeds, frame_attention_tokens = apply_frame_token_conditioning(
+                        prompt_embeds=prompt_embeds,
+                        frame_embeddings=frame_adapter_pooled,
+                        frame_tokens=frame_adapter_tokens,
+                        num_frames=frames.shape[1],
+                        mode=frame_encoder_config["token_embedding_mode"],
+                        alpha=float(frame_encoder_config.get("alpha", 1.0)),
+                    )
 
                 if not logged_shapes:
                     log_first_step_shapes(
@@ -613,6 +838,11 @@ def main() -> None:
                                 if frame_position_encoder is not None
                                 else None
                             ),
+                            "frame_attention_tokens": (
+                                tuple(frame_attention_tokens.shape)
+                                if frame_attention_tokens is not None
+                                else None
+                            ),
                             "modified_pooled_prompt_embeds": tuple(
                                 modified_pooled_prompt_embeds.shape
                             ),
@@ -630,7 +860,7 @@ def main() -> None:
                 set_video_attention_context(
                     unet,
                     num_frames=frames.shape[1],
-                    frame_tokens=frame_adapter_tokens,
+                    frame_tokens=frame_attention_tokens,
                 )
                 try:
                     model_pred = unet(
@@ -679,6 +909,34 @@ def main() -> None:
                         accelerator.log(metrics, step=global_step)
                     accelerator.print(f"step {global_step}: loss={avg_loss:.6f}")
 
+                if should_log_training_caption_inference(config, global_step):
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        training_prompt = batch["captions"][0]
+                        log_training_caption_inference(
+                            accelerator=accelerator,
+                            config=config,
+                            pipe=pipe,
+                            unet=unet,
+                            vae=vae,
+                            text_encoder=text_encoder,
+                            text_encoder_2=text_encoder_2,
+                            temporal_mlp=temporal_mlp,
+                            frame_position_encoder=frame_position_encoder,
+                            prompt=training_prompt,
+                            global_step=global_step,
+                            output_dir=output_dir,
+                            resolution=resolution,
+                            temporal_alpha=temporal_alpha,
+                            injection_mode=injection_mode,
+                            frame_encoder_config=frame_encoder_config,
+                        )
+                        accelerator.print(
+                            "logged training-caption inference sample "
+                            f"at step {global_step}: {training_prompt[:120]}"
+                        )
+                    accelerator.wait_for_everyone()
+
                 if (
                     int(training_config.get("checkpointing_steps", 0)) > 0
                     and global_step % int(training_config["checkpointing_steps"]) == 0
@@ -687,6 +945,7 @@ def main() -> None:
                         output_dir=output_dir,
                         step=global_step,
                         unet=unet,
+                        vae=vae,
                         temporal_mlp=temporal_mlp,
                         frame_position_encoder=frame_position_encoder,
                         config=config,
@@ -725,6 +984,8 @@ def main() -> None:
                             resolution=resolution,
                             temporal_alpha=temporal_alpha,
                             injection_mode=injection_mode,
+                            frame_token_embedding_mode=frame_encoder_config["token_embedding_mode"],
+                            frame_token_alpha=float(frame_encoder_config.get("alpha", 1.0)),
                             num_inference_steps=int(validation_config.get("num_inference_steps", 30)),
                             guidance_scale=float(validation_config.get("guidance_scale", 7.5)),
                             seed=training_config.get("seed"),
@@ -749,6 +1010,7 @@ def main() -> None:
         output_dir=output_dir,
         step=global_step,
         unet=unet,
+        vae=vae,
         temporal_mlp=temporal_mlp,
         frame_position_encoder=frame_position_encoder,
         config=config,

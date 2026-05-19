@@ -137,8 +137,13 @@ class VideoResnetBlock2D(nn.Module):
         )
         self.temporal_conv1 = IdentityTemporalConv3D(self.conv1.out_channels)
         self.temporal_conv2 = IdentityTemporalConv3D(self.conv2.out_channels)
-        self.frame_emb_proj = nn.Linear(self.frame_embedding_dim, frame_projection_dim, bias=False)
-        nn.init.zeros_(self.frame_emb_proj.weight)
+        self.frame_emb_proj = (
+            nn.Linear(self.frame_embedding_dim, frame_projection_dim, bias=False)
+            if self.use_frame_conditioning
+            else None
+        )
+        if self.frame_emb_proj is not None:
+            nn.init.zeros_(self.frame_emb_proj.weight)
 
         self.video_num_frames: int | None = None
         self.video_frame_embeddings: torch.Tensor | None = None
@@ -148,7 +153,8 @@ class VideoResnetBlock2D(nn.Module):
     def adapter_parameters(self) -> Iterator[nn.Parameter]:
         yield from self.temporal_conv1.parameters()
         yield from self.temporal_conv2.parameters()
-        yield from self.frame_emb_proj.parameters()
+        if self.frame_emb_proj is not None:
+            yield from self.frame_emb_proj.parameters()
 
     def set_video_context(
         self,
@@ -240,13 +246,8 @@ class VideoResnetBlock2D(nn.Module):
         return projected
 
     def _frame_temb(self, temb: torch.Tensor, out_channels: int) -> torch.Tensor:
-        if not self.active or not self.use_frame_conditioning:
-            return torch.zeros(
-                temb.shape[0],
-                out_channels,
-                device=temb.device,
-                dtype=temb.dtype,
-            )
+        if not self.active or not self.use_frame_conditioning or self.frame_emb_proj is None:
+            raise RuntimeError("Frame conditioning was requested but frame_emb_proj is unavailable.")
         frame_embeddings = self._make_placeholder_frame_embeddings(
             batch_size=temb.shape[0],
             device=temb.device,
@@ -280,10 +281,11 @@ class VideoResnetBlock2D(nn.Module):
             if not self.skip_time_act:
                 temb = self.nonlinearity(temb)
             projected_temb = self.time_emb_proj(temb)
-            projected_temb = projected_temb + self._frame_temb(
-                temb=temb,
-                out_channels=projected_temb.shape[-1],
-            )
+            if self.active and self.use_frame_conditioning:
+                projected_temb = projected_temb + self._frame_temb(
+                    temb=temb,
+                    out_channels=projected_temb.shape[-1],
+                )
             projected_temb = projected_temb[:, :, None, None]
         else:
             projected_temb = None
@@ -414,7 +416,8 @@ def sync_video_resnet_adapter_device_dtype(module: nn.Module) -> None:
     for block in iter_video_resnet_blocks(module):
         block.temporal_conv1.to(device=reference.device, dtype=reference.dtype)
         block.temporal_conv2.to(device=reference.device, dtype=reference.dtype)
-        block.frame_emb_proj.to(device=reference.device, dtype=reference.dtype)
+        if block.frame_emb_proj is not None:
+            block.frame_emb_proj.to(device=reference.device, dtype=reference.dtype)
 
 
 def video_resnet_adapter_state_dict(module: nn.Module) -> dict[str, torch.Tensor]:

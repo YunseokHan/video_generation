@@ -5,6 +5,7 @@ from typing import Any, Iterator
 
 import torch
 from torch import nn
+import torch.nn.functional as torch_f
 
 try:
     from diffusers.models.attention import BasicTransformerBlock, _chunked_feed_forward
@@ -22,6 +23,10 @@ class VideoAttentionAdapterConfig:
     train: bool = True
     use_temporal_self_attention: bool = True
     use_temporal_cross_attention: bool = True
+    use_temporal_ffn: bool = True
+    temporal_ffn_rank: int = 0
+    temporal_ffn_kernel_size: int = 3
+    temporal_ffn_gamma_init: float = 0.0
     include_prompt_tokens: bool = True
 
     @classmethod
@@ -36,6 +41,14 @@ class VideoAttentionAdapterConfig:
             ),
             use_temporal_cross_attention=bool(
                 values.get("use_temporal_cross_attention", cls.use_temporal_cross_attention)
+            ),
+            use_temporal_ffn=bool(values.get("use_temporal_ffn", cls.use_temporal_ffn)),
+            temporal_ffn_rank=int(values.get("temporal_ffn_rank", cls.temporal_ffn_rank)),
+            temporal_ffn_kernel_size=int(
+                values.get("temporal_ffn_kernel_size", cls.temporal_ffn_kernel_size)
+            ),
+            temporal_ffn_gamma_init=float(
+                values.get("temporal_ffn_gamma_init", cls.temporal_ffn_gamma_init)
             ),
             include_prompt_tokens=bool(values.get("include_prompt_tokens", cls.include_prompt_tokens)),
         )
@@ -57,6 +70,10 @@ class VideoBasicTransformerBlock(nn.Module):
         base: nn.Module,
         use_temporal_self_attention: bool = True,
         use_temporal_cross_attention: bool = True,
+        use_temporal_ffn: bool = True,
+        temporal_ffn_rank: int = 0,
+        temporal_ffn_kernel_size: int = 3,
+        temporal_ffn_gamma_init: float = 0.0,
         include_prompt_tokens: bool = True,
         active: bool = True,
     ) -> None:
@@ -112,8 +129,28 @@ class VideoBasicTransformerBlock(nn.Module):
         _zero_attention_output(self.temporal_self_attn)
         _zero_attention_output(self.temporal_cross_attn)
 
+        temporal_ffn_rank = int(temporal_ffn_rank)
+        if temporal_ffn_rank <= 0:
+            temporal_ffn_rank = max(dim // 4, 1)
+        temporal_ffn_kernel_size = int(temporal_ffn_kernel_size)
+        if temporal_ffn_kernel_size <= 0 or temporal_ffn_kernel_size % 2 == 0:
+            raise ValueError("temporal_ffn_kernel_size must be a positive odd integer.")
+        self.temporal_ffn_norm = nn.LayerNorm(dim)
+        self.temporal_ffn_in = nn.Linear(dim, temporal_ffn_rank)
+        self.temporal_ffn_conv = nn.Conv1d(
+            temporal_ffn_rank,
+            temporal_ffn_rank,
+            kernel_size=temporal_ffn_kernel_size,
+            padding=temporal_ffn_kernel_size // 2,
+        )
+        self.temporal_ffn_out = nn.Linear(temporal_ffn_rank, dim)
+        self.temporal_ffn_gamma = nn.Parameter(torch.tensor(float(temporal_ffn_gamma_init)))
+        nn.init.zeros_(self.temporal_ffn_out.weight)
+        nn.init.zeros_(self.temporal_ffn_out.bias)
+
         self.use_temporal_self_attention = bool(use_temporal_self_attention)
         self.use_temporal_cross_attention = bool(use_temporal_cross_attention)
+        self.use_temporal_ffn = bool(use_temporal_ffn)
         self.include_prompt_tokens = bool(include_prompt_tokens)
         self.active = bool(active)
         self.video_num_frames: int | None = None
@@ -125,6 +162,11 @@ class VideoBasicTransformerBlock(nn.Module):
         yield from self.temporal_self_attn.parameters()
         yield from self.temporal_cross_norm.parameters()
         yield from self.temporal_cross_attn.parameters()
+        yield from self.temporal_ffn_norm.parameters()
+        yield from self.temporal_ffn_in.parameters()
+        yield from self.temporal_ffn_conv.parameters()
+        yield from self.temporal_ffn_out.parameters()
+        yield self.temporal_ffn_gamma
 
     def set_chunk_feed_forward(self, chunk_size: int | None, dim: int = 0) -> None:
         self._chunk_size = chunk_size
@@ -174,7 +216,6 @@ class VideoBasicTransformerBlock(nn.Module):
         self,
         encoder_hidden_states: torch.Tensor | None,
         batch_size: int,
-        spatial_tokens: int,
     ) -> torch.Tensor | None:
         if encoder_hidden_states is None or not self.include_prompt_tokens:
             return None
@@ -193,14 +234,11 @@ class VideoBasicTransformerBlock(nn.Module):
             encoder_hidden_states.shape[1],
             encoder_hidden_states.shape[2],
         )
-        prompt = prompt[:, 0]
-        prompt = prompt[:, None, :, :].expand(batch_size, spatial_tokens, -1, -1)
-        return prompt.reshape(batch_size * spatial_tokens, prompt.shape[-2], prompt.shape[-1])
+        return prompt[:, 0]
 
     def _frame_context(
         self,
         batch_size: int,
-        spatial_tokens: int,
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor | None:
@@ -243,9 +281,11 @@ class VideoBasicTransformerBlock(nn.Module):
                 "Frame tokens must be [B*F, T, D], [B, F, D], or [B, F, T, D], got "
                 f"{tuple(frame_tokens.shape)}."
             )
-        frame_tokens = frame_tokens.reshape(batch_size, num_frames * frame_tokens.shape[-2], frame_tokens.shape[-1])
-        frame_tokens = frame_tokens[:, None, :, :].expand(batch_size, spatial_tokens, -1, -1)
-        return frame_tokens.reshape(batch_size * spatial_tokens, frame_tokens.shape[-2], frame_tokens.shape[-1])
+        return frame_tokens.reshape(
+            batch_size,
+            num_frames * frame_tokens.shape[-2],
+            frame_tokens.shape[-1],
+        )
 
     def _temporal_self_attention(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not self.active or not self.use_temporal_self_attention:
@@ -265,10 +305,9 @@ class VideoBasicTransformerBlock(nn.Module):
             return hidden_states
         norm_hidden_states = self.temporal_cross_norm(hidden_states)
         temporal, batch_size, spatial_tokens = self._to_temporal_tokens(norm_hidden_states)
-        prompt_context = self._prompt_context(encoder_hidden_states, batch_size, spatial_tokens)
+        prompt_context = self._prompt_context(encoder_hidden_states, batch_size)
         frame_context = self._frame_context(
             batch_size=batch_size,
-            spatial_tokens=spatial_tokens,
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
@@ -276,9 +315,29 @@ class VideoBasicTransformerBlock(nn.Module):
         if not contexts:
             return hidden_states
         context = torch.cat(contexts, dim=1) if len(contexts) > 1 else contexts[0]
-        temporal_output = self.temporal_cross_attn(temporal, encoder_hidden_states=context)
+        temporal_queries = temporal.reshape(batch_size, spatial_tokens, -1, temporal.shape[-1])
+        temporal_queries = temporal_queries.reshape(batch_size, spatial_tokens * temporal.shape[1], temporal.shape[-1])
+        temporal_output = self.temporal_cross_attn(
+            temporal_queries,
+            encoder_hidden_states=context,
+        )
+        temporal_output = temporal_output.reshape(batch_size, spatial_tokens, temporal.shape[1], temporal.shape[-1])
+        temporal_output = temporal_output.reshape(batch_size * spatial_tokens, temporal.shape[1], temporal.shape[-1])
         hidden_output = self._from_temporal_tokens(temporal_output, batch_size, spatial_tokens)
         return hidden_states + hidden_output
+
+    def _temporal_feed_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not self.active or not self.use_temporal_ffn:
+            return hidden_states
+        norm_hidden_states = self.temporal_ffn_norm(hidden_states)
+        temporal, batch_size, spatial_tokens = self._to_temporal_tokens(norm_hidden_states)
+        temporal = self.temporal_ffn_in(temporal)
+        temporal = self.temporal_ffn_conv(temporal.transpose(1, 2)).transpose(1, 2)
+        temporal = torch_f.silu(temporal)
+        temporal = self.temporal_ffn_out(temporal)
+        hidden_output = self._from_temporal_tokens(temporal, batch_size, spatial_tokens)
+        gamma = self.temporal_ffn_gamma.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        return hidden_states + gamma * hidden_output
 
     def forward(
         self,
@@ -387,6 +446,7 @@ class VideoBasicTransformerBlock(nn.Module):
             ff_output = gate_mlp * ff_output
 
         hidden_states = ff_output + hidden_states
+        hidden_states = self._temporal_feed_forward(hidden_states)
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
         return hidden_states
@@ -433,6 +493,10 @@ def inject_video_attention_adapters(
                         child,
                         use_temporal_self_attention=adapter_config.use_temporal_self_attention,
                         use_temporal_cross_attention=adapter_config.use_temporal_cross_attention,
+                        use_temporal_ffn=adapter_config.use_temporal_ffn,
+                        temporal_ffn_rank=adapter_config.temporal_ffn_rank,
+                        temporal_ffn_kernel_size=adapter_config.temporal_ffn_kernel_size,
+                        temporal_ffn_gamma_init=adapter_config.temporal_ffn_gamma_init,
                         include_prompt_tokens=adapter_config.include_prompt_tokens,
                         active=adapter_config.active,
                     ),
@@ -481,6 +545,14 @@ def sync_video_attention_adapter_device_dtype(module: nn.Module) -> None:
         block.temporal_self_attn.to(device=reference.device, dtype=reference.dtype)
         block.temporal_cross_norm.to(device=reference.device, dtype=reference.dtype)
         block.temporal_cross_attn.to(device=reference.device, dtype=reference.dtype)
+        block.temporal_ffn_norm.to(device=reference.device, dtype=reference.dtype)
+        block.temporal_ffn_in.to(device=reference.device, dtype=reference.dtype)
+        block.temporal_ffn_conv.to(device=reference.device, dtype=reference.dtype)
+        block.temporal_ffn_out.to(device=reference.device, dtype=reference.dtype)
+        block.temporal_ffn_gamma.data = block.temporal_ffn_gamma.data.to(
+            device=reference.device,
+            dtype=reference.dtype,
+        )
 
 
 def video_attention_adapter_state_dict(module: nn.Module) -> dict[str, torch.Tensor]:
@@ -490,11 +562,15 @@ def video_attention_adapter_state_dict(module: nn.Module) -> dict[str, torch.Ten
         ".temporal_self_attn.",
         ".temporal_cross_norm.",
         ".temporal_cross_attn.",
+        ".temporal_ffn_norm.",
+        ".temporal_ffn_in.",
+        ".temporal_ffn_conv.",
+        ".temporal_ffn_out.",
     )
     return {
         key: value.detach().cpu()
         for key, value in module.state_dict().items()
-        if any(name in key for name in adapter_names)
+        if any(name in key for name in adapter_names) or key.endswith(".temporal_ffn_gamma")
     }
 
 

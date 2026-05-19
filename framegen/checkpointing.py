@@ -19,6 +19,7 @@ from .video_resnet import (
 
 
 VIDEO_RESNET_ADAPTER_FILENAME = "resnet_video_adapter.pt"
+VAE_DECODER_RESNET_ADAPTER_FILENAME = "vae_decoder_video_adapter.pt"
 VIDEO_ATTENTION_ADAPTER_FILENAME = "attention_video_adapter.pt"
 FRAME_POSITION_ENCODER_FILENAME = "frame_position_encoder.pt"
 
@@ -35,6 +36,7 @@ def save_checkpoint(
     output_dir: str | Path,
     step: int,
     unet,
+    vae,
     temporal_mlp: FramePositionMLP,
     frame_position_encoder: torch.nn.Module | None,
     config: dict[str, Any],
@@ -52,6 +54,7 @@ def save_checkpoint(
         checkpoint_dir,
         step,
         unet,
+        vae,
         temporal_mlp,
         frame_position_encoder,
         config,
@@ -67,6 +70,7 @@ def _write_checkpoint(
     checkpoint_dir: Path,
     step: int,
     unet,
+    vae,
     temporal_mlp: FramePositionMLP,
     frame_position_encoder: torch.nn.Module | None,
     config: dict[str, Any],
@@ -86,6 +90,18 @@ def _write_checkpoint(
             },
             checkpoint_dir / VIDEO_RESNET_ADAPTER_FILENAME,
         )
+    if vae is not None:
+        vae_decoder = getattr(_unwrap(vae, accelerator), "decoder", _unwrap(vae, accelerator))
+        vae_decoder_resnet_state = video_resnet_adapter_state_dict(vae_decoder)
+        if vae_decoder_resnet_state:
+            torch.save(
+                {
+                    "global_step": step,
+                    "state_dict": vae_decoder_resnet_state,
+                    "config": config.get("video_adapters", {}).get("vae_decoder_resnet", {}),
+                },
+                checkpoint_dir / VAE_DECODER_RESNET_ADAPTER_FILENAME,
+            )
     video_attention_state = video_attention_adapter_state_dict(unwrapped_unet)
     if video_attention_state:
         torch.save(
@@ -160,6 +176,20 @@ def load_video_resnet_adapter_checkpoint(
         return None
     payload = torch.load(checkpoint_path, map_location=map_location)
     load_video_resnet_adapter_state_dict(unet, payload["state_dict"], strict=strict)
+    return dict(payload.get("config", {}))
+
+
+def load_vae_decoder_resnet_adapter_checkpoint(
+    checkpoint_dir: str | Path,
+    vae_decoder,
+    map_location: str | torch.device = "cpu",
+    strict: bool = True,
+) -> dict[str, Any] | None:
+    checkpoint_path = Path(checkpoint_dir) / VAE_DECODER_RESNET_ADAPTER_FILENAME
+    if not checkpoint_path.exists():
+        return None
+    payload = torch.load(checkpoint_path, map_location=map_location)
+    load_video_resnet_adapter_state_dict(vae_decoder, payload["state_dict"], strict=strict)
     return dict(payload.get("config", {}))
 
 

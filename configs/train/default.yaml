@@ -4,13 +4,29 @@ model:
   resolution: 1024
 
 data:
-  dataset_type: "placeholder"
+  dataset_type: "openvid"
+  openvid_root: "/NHNHOME/WORKSPACE/26moe001_D/dataset/OpenVid-1M/OpenVid_extracted"
+  openvid_csv: null
+  openvid_sources: null
+  openvid_max_videos: null
+  openvid_min_seconds: 1.0
+  openvid_min_frames: 8
+  openvid_min_aesthetic_score: null
+  openvid_min_motion_score: null
+  openvid_camera_motion: null
+  openvid_fallback_caption: "A video."
   num_frames_per_video: 8
   placeholder_num_videos: 100
   placeholder_caption: "A simple placeholder video caption"
   placeholder_image_dir: null
   frame_sampling: "uniform"
-  num_workers: 0
+  ffmpeg_path: "ffmpeg"
+  ffmpeg_threads: 1
+  strict_decode: false
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
 
 temporal_conditioning:
   type: "mlp"
@@ -23,16 +39,26 @@ temporal_conditioning:
 
 video_adapters:
   frame_position_encoder:
-    enabled: false
+    enabled: true
     type: "sinusoidal"
-    train: true
+    train: false
+    token_embedding_mode: "add_to_text"
+    alpha: 1.0
     embedding_dim: 2048
     hidden_dim: 1024
     num_layers: 2
     num_tokens: 1
     pooling: "mean"
+  vae_decoder_resnet:
+    enabled: true
+    active: true
+    train: false
+    frame_embedding_dim: 2048
+    use_temporal_conv1: true
+    use_temporal_conv2: true
+    use_frame_conditioning: false
   resnet:
-    enabled: false
+    enabled: true
     active: true
     train: true
     frame_embedding_dim: 2048
@@ -40,11 +66,15 @@ video_adapters:
     use_temporal_conv2: true
     use_frame_conditioning: true
   attention:
-    enabled: false
+    enabled: true
     active: true
     train: true
     use_temporal_self_attention: true
     use_temporal_cross_attention: true
+    use_temporal_ffn: true
+    temporal_ffn_rank: 0
+    temporal_ffn_kernel_size: 3
+    temporal_ffn_gamma_init: 0.0
     include_prompt_tokens: true
 
 training:
@@ -55,7 +85,7 @@ training:
   max_train_steps: 1000
   mixed_precision: "bf16"
   train_temporal_embedding: true
-  train_unet: true
+  train_unet: false
   train_text_encoder: false
   train_vae: false
   checkpointing_steps: 500
@@ -67,12 +97,24 @@ logging:
   report_to: "wandb"
   project: "sdxl-frame-generator"
   entity: null
-  run_name: null
+  run_name: sdxl-resnet-attention-sinusoidal
   group: null
   job_type: "train"
   tags: ["sdxl", "frame-generator", "temporal-mlp"]
   notes: null
-  log_validation_media: true
+  log_validation_media: false
+  log_training_caption_inference: false
+  training_caption_inference_steps: 100
+  training_caption_output_dir: "training_caption_samples"
+  training_caption_num_frames: 8
+  training_caption_num_inference_steps: 20
+  training_caption_guidance_scale: 7.5
+  training_caption_batch_size: null
+  training_caption_seed: null
+  training_caption_resolution: null
+  training_caption_save_grid: true
+  training_caption_save_mp4: false
+  training_caption_fps: 8
   wandb_watch: false
   wandb_watch_log: "gradients"
   wandb_watch_log_freq: 100
@@ -84,12 +126,12 @@ optimizer:
   eps: 1.0e-8
 
 validation:
-  enabled: true
+  enabled: false
   prompt: "A dog running through a grassy field, cinematic lighting"
   num_frames: 8
   output_dir: "validation"
   save_grid: true
-  save_mp4: true
+  save_mp4: false
   num_inference_steps: 30
   guidance_scale: 7.5
   batch_size: null

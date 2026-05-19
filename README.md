@@ -6,54 +6,151 @@ Experimental SDXL frame-level video generator baseline:
 p_image(x) -> p_frame(x | c, t_f)
 ```
 
-The implementation keeps SDXL text conditioning intact and injects normalized frame position through an MLP added to SDXL pooled prompt embeddings before the UNet added-conditioning path.
+The repository keeps the pretrained SDXL backbone intact and adds frame-aware
+adapters for UNet Resnet blocks, UNet attention blocks, VAE decoder Resnet
+blocks, and frame-wise token conditioning.
+
+## Maintenance Rule
+
+Every implementation change must update the matching markdown section under
+`information/` in the same change. Treat `information/` as the living design
+spec for future sessions and coding agents.
+
+Use these sections as the first stop before editing code:
+
+- `information/0_overview.md`: status, module map, implemented vs not fully implemented
+- `information/1_vae.md`: VAE and VAE decoder adapter behavior
+- `information/2_unet_resnet.md`: UNet Resnet adapter behavior
+- `information/3_attention.md`: temporal attention and temporal FFN behavior
+- `information/4_frame_conditioning.md`: pooled and token frame conditioning
+- `information/5_training_and_inference.md`: top-level entrypoints and checkpoint flow
+- `information/6_backbone_compatibility.md`: verified SDXL backbone compatibility notes
+- `information/7_openvid_dataloader.md`: OpenVid CSV/mp4 dataloader details
+- `information/8_resource_estimates.md`: parameter counts and VRAM estimates
+
+When adding a new module or ablation, either update the relevant file above or
+add a new numbered markdown file and link it here.
+
+## Environment
+
+The default scripts use the local `video` conda env:
+
+```text
+/NHNHOME/WORKSPACE/26moe001_D/miniconda3/envs/video/bin/python
+```
+
+The verified environment is:
+
+```text
+torch 2.12.0+cu130
+diffusers 0.38.0
+```
+
+Diffusers `0.38.0` ignores `dtype=` in `DiffusionPipeline.from_pretrained(...)`.
+Use `torch_dtype=` for actual bf16 loading:
+
+```python
+import torch
+from diffusers import DiffusionPipeline
+
+pipe = DiffusionPipeline.from_pretrained(
+    "stabilityai/stable-diffusion-xl-base-1.0",
+    torch_dtype=torch.bfloat16,
+    device_map="cuda",
+)
+```
+
+## Entrypoints
+
+Training, inference, and tests live at the repository root:
+
+```text
+train.py
+infer.py
+test.py
+```
+
+Config is managed under `configs/`, split by responsibility:
+
+```text
+configs/train/       # model, data, optimizer, logging, and ablation settings
+configs/accelerate/  # Accelerate launcher settings
+```
+
+## Configs
+
+Default sinusoidal frame-token setup:
+
+```bash
+TRAIN_CONFIG=configs/train/default.yaml bash scripts/train.sh
+```
+
+Learnable frame-token ablation:
+
+```bash
+TRAIN_CONFIG=configs/train/learnable_frame_tokens.yaml bash scripts/train.sh
+```
+
+`configs/train/default.yaml` enables:
+
+- UNet convolutional/Resnet video adapters
+- UNet attention video adapters
+- VAE decoder Resnet video adapters, active but not trained by default
+- sinusoidal frame-wise token embedding with `token_embedding_mode: add_to_text`
+- OpenVid video loading from `/NHNHOME/WORKSPACE/26moe001_D/dataset/OpenVid-1M/OpenVid_extracted`
+- adapter-only training with the base SDXL UNet, VAE, and text encoders frozen
+
+`configs/train/learnable_frame_tokens.yaml` keeps the same adapter setup but
+changes frame-wise token embedding to learned tokens with
+`token_embedding_mode: concat_tokens`.
+
+`configs/accelerate/default.yaml` is the default multi-GPU launcher config and
+uses 4 GPU processes (`gpu_ids: "0,1,2,3"`).
 
 ## Train
 
-Use the local environment that has diffusers installed. For one process:
+Default training uses `scripts/train.sh`, which owns both config choices:
 
 ```bash
 cd /NHNHOME/WORKSPACE/26moe001_D/yunseok/video_generation
-scripts/train_single_gpu.sh
+bash scripts/train.sh
 ```
 
-For multi-GPU, launch with Accelerate so each process is assigned one GPU:
+Override either config from the shell:
 
 ```bash
-cd /NHNHOME/WORKSPACE/26moe001_D/yunseok/video_generation
-NUM_PROCESSES=4 scripts/train_multi_gpu.sh
+TRAIN_CONFIG=configs/train/learnable_frame_tokens.yaml \
+ACCELERATE_CONFIG=configs/accelerate/default.yaml \
+bash scripts/train.sh
 ```
 
-The training script uses `Accelerator.prepare(...)` for the trainable modules, optimizer, and dataloader. Startup logs include the distributed type, process count, process index, local process index, and device.
-
-The shell wrappers read `.env` and accept environment-variable overrides:
+Compatibility wrappers are still available:
 
 ```bash
-CONFIG=configs/default.yaml ENV_FILE=.env WANDB_MODE=online scripts/train_single_gpu.sh
-CUDA_VISIBLE_DEVICES=0,1 NUM_PROCESSES=2 MIXED_PRECISION=bf16 scripts/train_multi_gpu.sh
+bash scripts/train_multi_gpu.sh    # delegates to scripts/train.sh
+bash scripts/train_single_gpu.sh   # delegates to scripts/train.sh with TRAIN_LAUNCHER=python
 ```
 
-The placeholder dataloader returns:
+The shell wrappers read `.env`; use `ENV_FILE=.env.other` to select another
+environment file. `CONFIG=...` still works as a legacy alias for
+`TRAIN_CONFIG=...`, but new work should use `TRAIN_CONFIG`.
+
+Fill these slots in `.env` before online training:
 
 ```text
-frames: [B, F, 3, H, W]
-captions: List[str]
-frame_positions: [B, F]
+HF_TOKEN=
+WANDB_API_KEY=
+WANDB_ENTITY=
+WANDB_MODE=online
 ```
 
-Training flattens this to image-like samples, repeats each caption across that video's frames, embeds `t_f`, and trains the SDXL UNet plus temporal MLP by default.
-
-## Environment And W&B
-
-Experiment environment variables are managed through a local `.env` file, which is intentionally gitignored. Start from [.env.example](/NHNHOME/WORKSPACE/26moe001_D/yunseok/video_generation/.env.example):
-
-```bash
-cp .env.example .env
-```
-
-Fill in `HF_TOKEN` for gated Hugging Face access and `WANDB_API_KEY` for online W&B logging. The default template sets `WANDB_MODE=offline` so a dry run can log locally without a key; switch it to `online` after adding the key.
-
-W&B logging is controlled by `logging:` in [configs/default.yaml](/NHNHOME/WORKSPACE/26moe001_D/yunseok/video_generation/configs/default.yaml). Logged metrics include loss, learning rate, global step, estimated frames seen, GPU max memory, parameter counts, checkpoint events, validation frame counts, and validation grid/video media.
+When `logging.report_to: "wandb"` is enabled, training metrics such as loss,
+learning rate, epoch progress, seen frames, parameter counts, checkpoint
+events, and GPU memory are logged to W&B. The training loop can also
+periodically run inference on one caption from the current training batch and
+log the generated grid/video under `train_caption/*`; configure this with
+`logging.log_training_caption_inference` and
+`logging.training_caption_inference_steps`.
 
 ## Inference
 
@@ -62,16 +159,18 @@ cd /NHNHOME/WORKSPACE/26moe001_D/yunseok/video_generation
 PROMPT="Astronaut walking through a jungle, cold color palette" \
 NUM_FRAMES=16 \
 OUTPUT_DIR=outputs/example_video \
-scripts/generate_video_frames.sh
+bash scripts/generate_video_frames.sh
 ```
 
-This writes `frame_000.png`, `frame_001.png`, and so on. Add `--save_mp4` to request `video.mp4` when `imageio` is available.
+This writes `frame_000.png`, `frame_001.png`, and so on. Add `--save_mp4` to
+request `video.mp4` when `imageio` is available.
 
-Useful scripts:
+## Tests
 
 ```bash
-scripts/train_single_gpu.sh
-scripts/train_multi_gpu.sh
-scripts/generate_video_frames.sh
-scripts/run_core_tests.sh
+cd /NHNHOME/WORKSPACE/26moe001_D/yunseok/video_generation
+bash scripts/run_core_tests.sh -q
 ```
+
+`test.py` can run directly even when `pytest` is not installed; if `pytest` is
+available, it delegates to pytest.

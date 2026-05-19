@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -16,15 +16,18 @@ import torch
 from diffusers import StableDiffusionXLPipeline, UNet2DConditionModel
 
 from framegen.checkpointing import (
+    VAE_DECODER_RESNET_ADAPTER_FILENAME,
     VIDEO_ATTENTION_ADAPTER_FILENAME,
     VIDEO_RESNET_ADAPTER_FILENAME,
     load_frame_position_encoder_checkpoint,
     load_temporal_mlp_checkpoint,
+    load_vae_decoder_resnet_adapter_checkpoint,
     load_video_attention_adapter_checkpoint,
     load_video_resnet_adapter_checkpoint,
 )
 from framegen.config import as_project_path, get_torch_dtype, load_config
 from framegen.generation import generate_video_frames
+from framegen.temporal import normalize_frame_token_mode
 from framegen.video_attention import (
     VideoAttentionAdapterConfig,
     inject_video_attention_adapters,
@@ -41,7 +44,7 @@ from framegen.video_resnet import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate temporally conditioned SDXL video frames.")
-    parser.add_argument("--config", default="configs/default.yaml", help="Path to config YAML.")
+    parser.add_argument("--config", default="configs/train/default.yaml", help="Path to config YAML.")
     parser.add_argument("--env_file", default=".env", help="Path to an environment-variable file.")
     parser.add_argument("--checkpoint", required=True, help="Checkpoint directory containing unet/ and temporal_mlp.pt.")
     parser.add_argument("--prompt", required=True, help="Video-level prompt shared by all frames.")
@@ -63,14 +66,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Load adapter weights but run the attention video adapters in off mode.",
     )
+    parser.add_argument(
+        "--disable_vae_decoder_adapters",
+        action="store_true",
+        help="Load adapter weights but run the VAE decoder video adapters in off mode.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = PROJECT_ROOT / config_path
     config = load_config(config_path)
-    project_root = config_path.resolve().parent.parent if config_path.parent.name == "configs" else Path.cwd()
+    project_root = PROJECT_ROOT
     env_file = Path(args.env_file)
     if not env_file.is_absolute():
         env_file = project_root / env_file
@@ -129,6 +139,36 @@ def main() -> None:
         )
         sync_video_resnet_adapter_device_dtype(pipe.unet)
 
+    vae_decoder = getattr(pipe.vae, "decoder", pipe.vae)
+    vae_decoder_checkpoint = checkpoint_dir / VAE_DECODER_RESNET_ADAPTER_FILENAME
+    if vae_decoder_checkpoint.exists():
+        payload = torch.load(vae_decoder_checkpoint, map_location="cpu")
+        vae_decoder_resnet_config = VideoResnetAdapterConfig.from_config(payload.get("config", {}))
+        vae_decoder_resnet_config.enabled = True
+    else:
+        vae_decoder_resnet_config = VideoResnetAdapterConfig.from_config(
+            config.get("video_adapters", {}).get("vae_decoder_resnet")
+        )
+    vae_decoder_resnet_blocks = inject_video_resnet_adapters(
+        vae_decoder,
+        vae_decoder_resnet_config,
+    )
+    if vae_decoder_resnet_blocks:
+        loaded_config = load_vae_decoder_resnet_adapter_checkpoint(
+            checkpoint_dir,
+            vae_decoder,
+            map_location="cpu",
+            strict=True,
+        )
+        if loaded_config is not None:
+            vae_decoder_resnet_config = VideoResnetAdapterConfig.from_config(loaded_config)
+            vae_decoder_resnet_config.enabled = True
+        set_video_resnet_adapters_active(
+            vae_decoder,
+            active=vae_decoder_resnet_config.active and not args.disable_vae_decoder_adapters,
+        )
+        sync_video_resnet_adapter_device_dtype(vae_decoder)
+
     video_attention_checkpoint = checkpoint_dir / VIDEO_ATTENTION_ADAPTER_FILENAME
     if video_attention_checkpoint.exists():
         payload = torch.load(video_attention_checkpoint, map_location="cpu")
@@ -158,12 +198,22 @@ def main() -> None:
     temporal_mlp, temporal_config = load_temporal_mlp_checkpoint(checkpoint_dir, map_location="cpu")
     temporal_mlp.to(device=device, dtype=torch_dtype)
     temporal_mlp.eval()
-    frame_position_encoder, _ = load_frame_position_encoder_checkpoint(
+    frame_position_encoder, frame_encoder_config = load_frame_position_encoder_checkpoint(
         checkpoint_dir,
         map_location="cpu",
     )
+    if frame_encoder_config is None:
+        frame_encoder_config = dict(config.get("video_adapters", {}).get("frame_position_encoder", {}))
+    frame_encoder_config.setdefault("token_embedding_mode", "temporal_cross_attention_only")
+    frame_encoder_config.setdefault("alpha", 1.0)
+    frame_encoder_config["token_embedding_mode"] = normalize_frame_token_mode(
+        frame_encoder_config["token_embedding_mode"]
+    )
     if frame_position_encoder is not None:
-        frame_position_encoder.to(device=device, dtype=torch_dtype)
+        if any(True for _ in frame_position_encoder.parameters()):
+            frame_position_encoder.to(device=device, dtype=torch_dtype)
+        else:
+            frame_position_encoder.to(device=device)
         frame_position_encoder.eval()
 
     pipe.to(device)
@@ -190,6 +240,8 @@ def main() -> None:
         resolution=int(model_config["resolution"]),
         temporal_alpha=float(temporal_config.get("alpha", config["temporal_conditioning"].get("alpha", 1.0))),
         injection_mode=temporal_config.get("injection_mode", "add_to_pooled_prompt_embeds"),
+        frame_token_embedding_mode=frame_encoder_config["token_embedding_mode"],
+        frame_token_alpha=float(frame_encoder_config.get("alpha", 1.0)),
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
         seed=args.seed,

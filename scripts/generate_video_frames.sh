@@ -8,6 +8,7 @@ source "${SCRIPT_DIR}/_common.sh"
 
 load_shell_env "${ENV_FILE}"
 
+INFER_CONFIG="${INFER_CONFIG:-${CONFIG:-configs/train/default.yaml}}"
 CHECKPOINT="${CHECKPOINT:-outputs/sdxl_frame_generator/checkpoint-last}"
 PROMPT="${PROMPT:-Astronaut walking through a jungle, cold color palette}"
 NUM_FRAMES="${NUM_FRAMES:-16}"
@@ -17,8 +18,8 @@ NO_GRID="${NO_GRID:-0}"
 
 cmd=(
   "${PYTHON_BIN}"
-  "inference/generate_video_frames.py"
-  "--config" "${CONFIG}"
+  "infer.py"
+  "--config" "${INFER_CONFIG}"
   "--env_file" "${ENV_FILE}"
   "--checkpoint" "${CHECKPOINT}"
   "--prompt" "${PROMPT}"
