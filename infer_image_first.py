@@ -13,7 +13,7 @@ from framegen.env import get_hf_cache_dir, get_hf_token, load_env_file
 load_env_file(PROJECT_ROOT / ".env", override=False)
 
 import torch
-from diffusers import AutoencoderKL, StableDiffusionXLPipeline, UNet2DConditionModel
+from diffusers import StableDiffusionXLPipeline, UNet2DConditionModel
 
 from framegen.checkpointing import (
     VAE_DECODER_RESNET_ADAPTER_FILENAME,
@@ -26,7 +26,10 @@ from framegen.checkpointing import (
     load_video_resnet_adapter_checkpoint,
 )
 from framegen.config import as_project_path, get_torch_dtype, load_config
-from framegen.generation import generate_video_frames, guidance_scale_label
+from framegen.image_first_generation import (
+    generate_image_first_video_frames,
+    image_first_output_dir,
+)
 from framegen.temporal import normalize_frame_token_mode
 from framegen.video_attention import (
     VideoAttentionAdapterConfig,
@@ -40,10 +43,13 @@ from framegen.video_resnet import (
     set_video_resnet_adapters_active,
     sync_video_resnet_adapter_device_dtype,
 )
+from infer import load_sdxl_vae, resolve_checkpoint_dir, resolve_config_path
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate temporally conditioned SDXL video frames.")
+    parser = argparse.ArgumentParser(
+        description="Generate video with image-first SDXL denoising and video adapters after t1."
+    )
     parser.add_argument(
         "--config",
         default=None,
@@ -53,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         default=None,
-        help="Checkpoint directory containing unet/ and temporal_mlp.pt.",
+        help="Checkpoint directory containing unet/ and adapter checkpoints.",
     )
     parser.add_argument(
         "--name",
@@ -65,27 +71,28 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Checkpoint step used with --name. Use an integer step or 'last'.",
     )
-    parser.add_argument("--prompt", required=True, help="Video-level prompt shared by all frames.")
-    parser.add_argument("--num_frames", type=int, required=True, help="Number of frames to generate.")
+    parser.add_argument("--prompt", default=None, help="Video prompt. Defaults to validation.prompt.")
+    parser.add_argument("--num_frames", type=int, default=None, help="Number of frames to generate.")
+    parser.add_argument(
+        "--t1",
+        "--t1_ratio",
+        dest="t1_ratio",
+        type=float,
+        required=True,
+        help="Denoising ratio spent with adapters off before repeating the image latent.",
+    )
+    parser.add_argument("--guidance_scale", type=float, default=8.0)
     parser.add_argument(
         "--output_dir",
         default=None,
-        help="Directory for frame_000.png, grid.png, and video.mp4. Defaults to outputs/infer/{name}-{step}.",
+        help="Output root. Defaults to outputs/infer_image_first/{name}-{step}.",
     )
     parser.add_argument("--num_inference_steps", type=int, default=None)
-    parser.add_argument("--guidance_scale", type=float, default=None)
-    parser.add_argument(
-        "--guidance_scales",
-        nargs="+",
-        default=None,
-        help="One or more CFG guidance scales. Defaults to validation.guidance_scales or 1 8.",
-    )
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument(
         "--save_mp4",
         action="store_true",
-        help="Also write video.mp4 when imageio is installed.",
+        help="Also write video.mp4 when MP4 export support is available.",
     )
     parser.add_argument(
         "--no_mp4",
@@ -93,119 +100,42 @@ def parse_args() -> argparse.Namespace:
         help="Skip video.mp4 export, including in --name/--step mode.",
     )
     parser.add_argument("--no_grid", action="store_true", help="Skip grid.png export.")
+    parser.add_argument("--fps", type=int, default=None)
     parser.add_argument(
         "--disable_video_resnet_adapters",
         action="store_true",
-        help="Load adapter weights but run the Resnet video adapters in off mode.",
+        help="Load adapter weights but keep UNet Resnet video adapters inactive.",
     )
     parser.add_argument(
         "--disable_video_attention_adapters",
         action="store_true",
-        help="Load adapter weights but run the attention video adapters in off mode.",
+        help="Load adapter weights but keep UNet attention video adapters inactive.",
     )
     parser.add_argument(
         "--disable_vae_decoder_adapters",
         action="store_true",
-        help="Load adapter weights but run the VAE decoder video adapters in off mode.",
+        help="Load adapter weights but keep VAE decoder video adapters inactive.",
     )
     return parser.parse_args()
 
 
-def resolve_checkpoint_dir(args: argparse.Namespace, project_root: Path) -> Path:
-    if args.checkpoint is not None:
-        return as_project_path(args.checkpoint, project_root)
-    if args.name is None or args.step is None:
-        raise ValueError("Provide either --checkpoint or both --name and --step.")
-    checkpoint_name = "checkpoint-last" if str(args.step) == "last" else f"checkpoint-{args.step}"
-    return project_root / "outputs" / str(args.name) / checkpoint_name
-
-
-def resolve_output_dir(args: argparse.Namespace, project_root: Path) -> Path:
+def resolve_output_root(args: argparse.Namespace, project_root: Path) -> Path:
     if args.output_dir is not None:
         return as_project_path(args.output_dir, project_root)
     if args.name is not None and args.step is not None:
-        return project_root / "outputs" / "infer" / f"{args.name}-{args.step}"
+        return project_root / "outputs" / "infer_image_first" / f"{args.name}-{args.step}"
     raise ValueError("Provide --output_dir when --name/--step is not used.")
 
 
-def resolve_config_path(args: argparse.Namespace, checkpoint_dir: Path, project_root: Path) -> Path:
-    if args.config is not None:
-        config_path = Path(args.config)
-        return config_path if config_path.is_absolute() else project_root / config_path
-    checkpoint_config = checkpoint_dir / "config.yaml"
-    if checkpoint_config.exists():
-        return checkpoint_config
-    return project_root / "configs" / "train" / "default.yaml"
-
-
-def load_sdxl_vae(model_config: dict, vae_dtype: torch.dtype) -> AutoencoderKL:
-    vae_path = model_config.get("pretrained_vae_model_name_or_path")
-    if vae_path is None:
-        vae_path = model_config["pretrained_model_name_or_path"]
-        subfolder = "vae"
-    else:
-        subfolder = None
-
-    kwargs = {"torch_dtype": vae_dtype}
-    if subfolder is not None:
-        kwargs["subfolder"] = subfolder
-    if model_config.get("revision") is not None:
-        kwargs["revision"] = model_config["revision"]
-    if model_config.get("variant") is not None:
-        kwargs["variant"] = model_config["variant"]
-    cache_dir = get_hf_cache_dir(model_config)
-    if cache_dir is not None:
-        kwargs["cache_dir"] = cache_dir
-    token = get_hf_token(model_config)
-    if token is not None:
-        kwargs["token"] = token
-    return AutoencoderKL.from_pretrained(vae_path, **kwargs)
-
-
-def _as_float_list(values) -> list[float]:
-    if values is None:
-        return []
-    if isinstance(values, (int, float)):
-        return [float(values)]
-    if isinstance(values, str):
-        values = values.replace(",", " ").split()
-    result = []
-    for value in values:
-        if isinstance(value, str) and "," in value:
-            result.extend(_as_float_list(value))
-        else:
-            result.append(float(value))
-    return result
-
-
-def resolve_guidance_scales(args: argparse.Namespace, validation_config: dict) -> list[float]:
-    if args.guidance_scale is not None and args.guidance_scales is not None:
-        raise ValueError("Use only one of --guidance_scale or --guidance_scales.")
-    if args.guidance_scale is not None:
-        return [float(args.guidance_scale)]
-    if args.guidance_scales is not None:
-        return _as_float_list(args.guidance_scales)
-    return _as_float_list(validation_config.get("guidance_scales", [1.0, 8.0]))
-
-
-def main() -> None:
-    args = parse_args()
-    project_root = PROJECT_ROOT
-    env_file = Path(args.env_file)
-    if not env_file.is_absolute():
-        env_file = project_root / env_file
-    load_env_file(env_file, override=True)
-    checkpoint_dir = resolve_checkpoint_dir(args, project_root)
-    output_dir = resolve_output_dir(args, project_root)
-    config_path = resolve_config_path(args, checkpoint_dir, project_root)
-    config = load_config(config_path)
-
+def load_image_first_pipeline(
+    args: argparse.Namespace,
+    config: dict,
+    checkpoint_dir: Path,
+    torch_dtype: torch.dtype,
+    vae_dtype: torch.dtype,
+    device: torch.device,
+):
     model_config = config["model"]
-    validation_config = config.get("validation", {})
-    torch_dtype = get_torch_dtype(model_config.get("dtype", "bf16"))
-    vae_dtype = get_torch_dtype(model_config.get("vae_dtype", model_config.get("dtype", "bf16")))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     kwargs = {"torch_dtype": torch_dtype}
     if model_config.get("revision") is not None:
         kwargs["revision"] = model_config["revision"]
@@ -223,11 +153,11 @@ def main() -> None:
         **kwargs,
     )
     pipe.vae = load_sdxl_vae(model_config, vae_dtype)
+
     unet_dir = checkpoint_dir / "unet"
-    if unet_dir.exists():
-        pipe.unet = UNet2DConditionModel.from_pretrained(unet_dir, torch_dtype=torch_dtype)
-    else:
+    if not unet_dir.exists():
         raise FileNotFoundError(f"Missing trained UNet directory: {unet_dir}")
+    pipe.unet = UNet2DConditionModel.from_pretrained(unet_dir, torch_dtype=torch_dtype)
 
     video_resnet_checkpoint = checkpoint_dir / VIDEO_RESNET_ADAPTER_FILENAME
     if video_resnet_checkpoint.exists():
@@ -334,46 +264,85 @@ def main() -> None:
 
     pipe.to(device)
     pipe.set_progress_bar_config(disable=False)
+    return pipe, temporal_mlp, temporal_config, frame_position_encoder, frame_encoder_config
 
+
+def main() -> None:
+    args = parse_args()
+    project_root = PROJECT_ROOT
+    env_file = Path(args.env_file)
+    if not env_file.is_absolute():
+        env_file = project_root / env_file
+    load_env_file(env_file, override=True)
+
+    checkpoint_dir = resolve_checkpoint_dir(args, project_root)
+    config_path = resolve_config_path(args, checkpoint_dir, project_root)
+    config = load_config(config_path)
+    model_config = config["model"]
+    validation_config = config.get("validation", {})
+
+    prompt = args.prompt or validation_config.get("prompt")
+    if not prompt:
+        raise ValueError("Provide --prompt or set validation.prompt in the config.")
+    num_frames = args.num_frames
+    if num_frames is None:
+        num_frames = int(validation_config.get("num_frames", 0))
+    if int(num_frames) <= 0:
+        raise ValueError("Provide --num_frames or set validation.num_frames > 0 in the config.")
+    if not 0.0 <= float(args.t1_ratio) <= 1.0:
+        raise ValueError("--t1 must be in [0, 1].")
+
+    torch_dtype = get_torch_dtype(model_config.get("dtype", "bf16"))
+    vae_dtype = get_torch_dtype(model_config.get("vae_dtype", model_config.get("dtype", "bf16")))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pipe, temporal_mlp, temporal_config, frame_position_encoder, frame_encoder_config = (
+        load_image_first_pipeline(
+            args=args,
+            config=config,
+            checkpoint_dir=checkpoint_dir,
+            torch_dtype=torch_dtype,
+            vae_dtype=vae_dtype,
+            device=device,
+        )
+    )
+
+    output_root = resolve_output_root(args, project_root)
+    output_dir = image_first_output_dir(
+        output_root,
+        t1_ratio=float(args.t1_ratio),
+        guidance_scale=float(args.guidance_scale),
+    )
     num_inference_steps = (
         args.num_inference_steps
         if args.num_inference_steps is not None
         else int(validation_config.get("num_inference_steps", 30))
     )
-    guidance_scales = resolve_guidance_scales(args, validation_config)
-    if not guidance_scales:
-        raise ValueError("At least one guidance scale is required.")
+    fps = args.fps if args.fps is not None else int(validation_config.get("fps", 8))
+    save_video = (args.save_mp4 or (args.name is not None and args.step is not None)) and not args.no_mp4
 
-    all_frame_paths = []
-    for guidance_scale in guidance_scales:
-        scale_output_dir = (
-            output_dir / guidance_scale_label(guidance_scale)
-            if len(guidance_scales) > 1
-            else output_dir
-        )
-        frame_paths = generate_video_frames(
-            pipe=pipe,
-            temporal_mlp=temporal_mlp,
-            frame_position_encoder=frame_position_encoder,
-            prompt=args.prompt,
-            num_frames=args.num_frames,
-            output_dir=scale_output_dir,
-            resolution=int(model_config["resolution"]),
-            temporal_alpha=float(temporal_config.get("alpha", config["temporal_conditioning"].get("alpha", 1.0))),
-            injection_mode=temporal_config.get("injection_mode", "add_to_pooled_prompt_embeds"),
-            frame_token_embedding_mode=frame_encoder_config["token_embedding_mode"],
-            frame_token_alpha=float(frame_encoder_config.get("alpha", 1.0)),
-            num_inference_steps=num_inference_steps,
-            guidance_scale=float(guidance_scale),
-            seed=args.seed,
-            batch_size=args.batch_size,
-            save_grid=not args.no_grid,
-            save_video=(args.save_mp4 or (args.name is not None and args.step is not None)) and not args.no_mp4,
-        )
-        all_frame_paths.extend(frame_paths)
-        print(f"Saved CFG {guidance_scale:g} outputs to {scale_output_dir}")
+    frame_paths = generate_image_first_video_frames(
+        pipe=pipe,
+        temporal_mlp=temporal_mlp,
+        frame_position_encoder=frame_position_encoder,
+        prompt=str(prompt),
+        num_frames=int(num_frames),
+        output_dir=output_dir,
+        resolution=int(model_config["resolution"]),
+        temporal_alpha=float(temporal_config.get("alpha", config["temporal_conditioning"].get("alpha", 1.0))),
+        t1_ratio=float(args.t1_ratio),
+        guidance_scale=float(args.guidance_scale),
+        injection_mode=temporal_config.get("injection_mode", "add_to_pooled_prompt_embeds"),
+        frame_token_embedding_mode=frame_encoder_config["token_embedding_mode"],
+        frame_token_alpha=float(frame_encoder_config.get("alpha", 1.0)),
+        num_inference_steps=int(num_inference_steps),
+        seed=args.seed,
+        save_grid=not args.no_grid,
+        save_video=save_video,
+        fps=int(fps),
+    )
     print(f"Loaded checkpoint from {checkpoint_dir}")
-    print(f"Saved {len(all_frame_paths)} frames across {len(guidance_scales)} CFG setting(s) to {output_dir}")
+    print(f"Saved image-first outputs to {output_dir}")
+    print(f"Saved {len(frame_paths)} frames with t1={float(args.t1_ratio):g}, CFG={float(args.guidance_scale):g}")
 
 
 if __name__ == "__main__":

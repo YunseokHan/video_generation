@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
+import subprocess
 from typing import Iterable
 
 from PIL import Image
@@ -59,16 +61,65 @@ def save_image_grid(images: list[Image.Image], output_path: str | Path, columns:
 
 def save_mp4(images: list[Image.Image], output_path: str | Path, fps: int = 8) -> bool:
     try:
-        import imageio.v3 as iio
         import numpy as np
     except ImportError:
+        print("MP4 export failed: numpy is unavailable.")
         return False
 
     frames = [np.asarray(image.convert("RGB")) for image in images]
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
     try:
+        import imageio.v3 as iio
+
         iio.imwrite(output_path, frames, fps=fps)
+        return True
+    except Exception as imageio_error:
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            print(f"MP4 export failed with imageio and ffmpeg was not found: {imageio_error}")
+            return False
+
+    frame_array = np.stack(frames, axis=0)
+    height, width = frame_array.shape[1:3]
+    command = [
+        ffmpeg,
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(int(fps)),
+        "-i",
+        "pipe:0",
+        "-an",
+        "-vcodec",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            input=frame_array.tobytes(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
     except Exception:
+        print("MP4 export failed: ffmpeg fallback could not be executed.")
         return False
-    return True
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        print(f"MP4 export failed with ffmpeg fallback: {stderr}")
+        return False
+    return output_path.exists()

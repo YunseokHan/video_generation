@@ -1,7 +1,11 @@
 model:
   pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
+  pretrained_vae_model_name_or_path: null
+  revision: null
+  variant: null
   dtype: "bf16"
-  resolution: 1024
+  vae_dtype: "fp32"
+  resolution: 512
 
 data:
   dataset_type: "openvid"
@@ -20,6 +24,9 @@ data:
   placeholder_caption: "A simple placeholder video caption"
   placeholder_image_dir: null
   frame_sampling: "uniform"
+  center_crop: false
+  random_flip: false
+  image_interpolation_mode: "lanczos"
   ffmpeg_path: "ffmpeg"
   ffmpeg_threads: 1
   strict_decode: false
@@ -78,31 +85,52 @@ video_adapters:
     include_prompt_tokens: true
 
 training:
-  output_dir: "outputs/sdxl_frame_generator"
-  train_batch_size: 1
+  output_dir: "outputs/sdxl-resnet-attention-sinusoidal-res512-bs5"
+  train_batch_size: 5
   gradient_accumulation_steps: 4
   learning_rate: 1.0e-5
-  max_train_steps: 1000
+  scale_lr: false
+  lr_scheduler: "constant"
+  lr_warmup_steps: 500
+  num_train_epochs: 100
+  max_train_steps: 15000
   mixed_precision: "bf16"
   train_temporal_embedding: true
   train_unet: false
   train_text_encoder: false
   train_vae: false
+  gradient_checkpointing: false
+  allow_tf32: false
+  enable_xformers_memory_efficient_attention: false
+  use_8bit_adam: false
+  max_grad_norm: 1.0
+  prediction_type: null
+  noise_offset: 0.0
+  snr_gamma: null
+  timestep_bias_strategy: "none"
+  timestep_bias_multiplier: 1.0
+  timestep_bias_begin: 0
+  timestep_bias_end: 1000
+  timestep_bias_portion: 0.25
+  proportion_empty_prompts: 0.0
   checkpointing_steps: 500
-  validation_steps: 100
+  checkpoints_total_limit: null
+  resume_from_checkpoint: null
+  validation_steps: 1000
   logging_steps: 10
+  logging_dir: "logs"
   seed: 42
 
 logging:
   report_to: "wandb"
   project: "sdxl-frame-generator"
   entity: null
-  run_name: sdxl-resnet-attention-sinusoidal
+  run_name: sdxl-resnet-attention-sinusoidal-res512-bs5
   group: null
   job_type: "train"
   tags: ["sdxl", "frame-generator", "temporal-mlp"]
   notes: null
-  log_validation_media: false
+  log_validation_media: true
   log_training_caption_inference: false
   training_caption_inference_steps: 100
   training_caption_output_dir: "training_caption_samples"
@@ -126,12 +154,12 @@ optimizer:
   eps: 1.0e-8
 
 validation:
-  enabled: false
+  enabled: true
   prompt: "A dog running through a grassy field, cinematic lighting"
   num_frames: 8
   output_dir: "validation"
   save_grid: true
-  save_mp4: false
+  save_mp4: true
   num_inference_steps: 30
-  guidance_scale: 7.5
+  guidance_scales: [1.0, 8.0]
   batch_size: null

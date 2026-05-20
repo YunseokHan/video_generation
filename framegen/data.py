@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import shutil
 import subprocess
 from pathlib import Path
@@ -19,6 +20,18 @@ except ImportError:  # pragma: no cover - torch environments generally include n
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".mkv", ".avi"}
 DEFAULT_OPENVID_ROOT = "/NHNHOME/WORKSPACE/26moe001_D/dataset/OpenVid-1M/OpenVid_extracted"
+PIL_INTERPOLATION = {
+    "nearest": Image.Resampling.NEAREST,
+    "bilinear": Image.Resampling.BILINEAR,
+    "bicubic": Image.Resampling.BICUBIC,
+    "lanczos": Image.Resampling.LANCZOS,
+}
+FFMPEG_SCALE_FLAGS = {
+    "nearest": "neighbor",
+    "bilinear": "bilinear",
+    "bicubic": "bicubic",
+    "lanczos": "lanczos",
+}
 
 
 def make_frame_positions(num_frames: int, normalize: bool = True) -> torch.Tensor:
@@ -53,10 +66,35 @@ def flatten_video_batch(batch: dict[str, Any]) -> tuple[torch.Tensor, list[str],
 
 
 def video_collate_fn(items: list[dict[str, Any]]) -> dict[str, Any]:
+    def metadata_tensor(item: dict[str, Any], key: str, default: tuple[int, int]) -> torch.Tensor:
+        value = item.get(key, default)
+        if isinstance(value, torch.Tensor):
+            return value.long()
+        return torch.tensor(value, dtype=torch.long)
+
+    first_resolution = int(items[0]["frames"].shape[-1])
     return {
         "frames": torch.stack([item["frames"] for item in items], dim=0),
         "captions": [item["caption"] for item in items],
         "frame_positions": torch.stack([item["frame_positions"] for item in items], dim=0),
+        "original_sizes": torch.stack(
+            [
+                metadata_tensor(item, "original_size", (first_resolution, first_resolution))
+                for item in items
+            ],
+            dim=0,
+        ),
+        "crop_top_lefts": torch.stack(
+            [metadata_tensor(item, "crop_top_left", (0, 0)) for item in items],
+            dim=0,
+        ),
+        "target_sizes": torch.stack(
+            [
+                metadata_tensor(item, "target_size", (first_resolution, first_resolution))
+                for item in items
+            ],
+            dim=0,
+        ),
     }
 
 
@@ -77,6 +115,9 @@ class PlaceholderVideoDataset(Dataset):
         image_dir: str | Path | None = None,
         frame_sampling: str = "uniform",
         normalize_positions: bool = True,
+        center_crop: bool = False,
+        random_flip: bool = False,
+        image_interpolation_mode: str = "lanczos",
         seed: int = 0,
     ) -> None:
         if frame_sampling != "uniform":
@@ -87,6 +128,12 @@ class PlaceholderVideoDataset(Dataset):
         self.caption = caption
         self.frame_sampling = frame_sampling
         self.normalize_positions = normalize_positions
+        self.center_crop = bool(center_crop)
+        self.random_flip = bool(random_flip)
+        self.interpolation = PIL_INTERPOLATION.get(
+            str(image_interpolation_mode).lower(),
+            Image.Resampling.LANCZOS,
+        )
         self.seed = int(seed)
 
         self.image_paths: list[Path] = []
@@ -120,6 +167,9 @@ class PlaceholderVideoDataset(Dataset):
             "frames": frames,
             "caption": self.caption,
             "frame_positions": frame_positions,
+            "original_size": (self.resolution, self.resolution),
+            "crop_top_left": (0, 0),
+            "target_size": (self.resolution, self.resolution),
         }
 
     def _load_image_frames(self, index: int) -> torch.Tensor:
@@ -133,10 +183,13 @@ class PlaceholderVideoDataset(Dataset):
             selected = [int((value + index) % count) for value in base]
 
         frames = []
+        do_flip = bool(self.random_flip and torch.rand(()).item() < 0.5)
         for image_index in selected:
             image = Image.open(self.image_paths[image_index])
             image = ImageOps.exif_transpose(image).convert("RGB")
-            image = image.resize((self.resolution, self.resolution), Image.BICUBIC)
+            image = image.resize((self.resolution, self.resolution), self.interpolation)
+            if do_flip:
+                image = ImageOps.mirror(image)
             array = np.asarray(image).copy()
             tensor = torch.from_numpy(array).permute(2, 0, 1).float() / 127.5 - 1.0
             frames.append(tensor)
@@ -207,6 +260,9 @@ class OpenVidVideoDataset(Dataset):
         ffmpeg_path: str = "ffmpeg",
         ffmpeg_threads: int = 1,
         strict_decode: bool = False,
+        center_crop: bool = False,
+        random_flip: bool = False,
+        image_interpolation_mode: str = "lanczos",
     ) -> None:
         if frame_sampling not in {"uniform", "random"}:
             raise ValueError(f"OpenVid frame_sampling must be 'uniform' or 'random', got {frame_sampling!r}.")
@@ -220,6 +276,13 @@ class OpenVidVideoDataset(Dataset):
         self.ffmpeg_path = ffmpeg_path
         self.ffmpeg_threads = max(1, int(ffmpeg_threads))
         self.strict_decode = bool(strict_decode)
+        self.center_crop = bool(center_crop)
+        self.random_flip = bool(random_flip)
+        self.ffmpeg_scale_flags = FFMPEG_SCALE_FLAGS.get(
+            str(image_interpolation_mode).lower(),
+            "lanczos",
+        )
+        self._dimension_cache: dict[Path, tuple[int, int]] = {}
 
         if self.num_frames_per_video <= 0:
             raise ValueError("num_frames_per_video must be positive.")
@@ -311,12 +374,16 @@ class OpenVidVideoDataset(Dataset):
         if frame_count is None or frame_count <= 0:
             frame_count = self._probe_frame_count(sample["path"])
         frame_indices = self._sample_frame_indices(frame_count)
-        frames = self._decode_frames(sample["path"], frame_indices)
+        transform = self._sample_spatial_transform(sample["path"])
+        frames = self._decode_frames(sample["path"], frame_indices, transform)
         frame_positions = self._make_positions(frame_indices, frame_count)
         return {
             "frames": frames,
             "caption": sample["caption"],
             "frame_positions": frame_positions,
+            "original_size": transform["original_size"],
+            "crop_top_left": transform["crop_top_left"],
+            "target_size": transform["target_size"],
         }
 
     def _probe_frame_count(self, path: Path) -> int:
@@ -342,6 +409,59 @@ class OpenVidVideoDataset(Dataset):
             raise RuntimeError(f"Could not probe frame count for {path}: {result.stderr.strip()}")
         return frame_count
 
+    def _probe_video_dimensions(self, path: Path) -> tuple[int, int]:
+        cached = self._dimension_cache.get(path)
+        if cached is not None:
+            return cached
+        ffprobe_path = shutil.which("ffprobe")
+        if ffprobe_path is None:
+            self._dimension_cache[path] = (self.resolution, self.resolution)
+            return self._dimension_cache[path]
+        command = [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=s=x:p=0",
+            str(path),
+        ]
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        width = height = None
+        if result.returncode == 0 and "x" in result.stdout:
+            width_text, height_text = result.stdout.strip().split("x", maxsplit=1)
+            width = _optional_int(width_text)
+            height = _optional_int(height_text)
+        if width is None or height is None or width <= 0 or height <= 0:
+            width = height = self.resolution
+        self._dimension_cache[path] = (int(width), int(height))
+        return self._dimension_cache[path]
+
+    def _sample_spatial_transform(self, path: Path) -> dict[str, Any]:
+        width, height = self._probe_video_dimensions(path)
+        scale = self.resolution / max(min(width, height), 1)
+        scaled_width = max(self.resolution, int(math.ceil(width * scale)))
+        scaled_height = max(self.resolution, int(math.ceil(height * scale)))
+        max_x = max(scaled_width - self.resolution, 0)
+        max_y = max(scaled_height - self.resolution, 0)
+        if self.center_crop:
+            crop_x = max_x // 2
+            crop_y = max_y // 2
+        else:
+            crop_x = int(torch.randint(0, max_x + 1, ()).item()) if max_x > 0 else 0
+            crop_y = int(torch.randint(0, max_y + 1, ()).item()) if max_y > 0 else 0
+        hflip = bool(self.random_flip and torch.rand(()).item() < 0.5)
+        return {
+            "original_size": (int(height), int(width)),
+            "scaled_size": (int(scaled_height), int(scaled_width)),
+            "crop_top_left": (int(crop_y), int(crop_x)),
+            "target_size": (self.resolution, self.resolution),
+            "hflip": hflip,
+        }
+
     def _sample_frame_indices(self, frame_count: int) -> list[int]:
         usable_count = max(int(frame_count), 1)
         if self.frame_sampling == "uniform":
@@ -357,13 +477,26 @@ class OpenVidVideoDataset(Dataset):
             return positions / max(int(frame_count) - 1, 1)
         return positions
 
-    def _decode_frames(self, path: Path, frame_indices: list[int]) -> torch.Tensor:
+    def _decode_frames(
+        self,
+        path: Path,
+        frame_indices: list[int],
+        transform: dict[str, Any],
+    ) -> torch.Tensor:
         unique_indices = sorted(set(frame_indices))
         select_expression = "+".join(f"eq(n,{index})" for index in unique_indices)
+        scaled_height, scaled_width = transform["scaled_size"]
+        crop_y, crop_x = transform["crop_top_left"]
+        filters = [
+            f"select='{select_expression}'",
+            f"scale={scaled_width}:{scaled_height}:flags={self.ffmpeg_scale_flags}",
+        ]
+        if transform.get("hflip", False):
+            filters.append("hflip")
+        filters.append(f"crop={self.resolution}:{self.resolution}:{crop_x}:{crop_y}")
+        filters.append("setsar=1")
         video_filter = (
-            f"select='{select_expression}',"
-            f"scale={self.resolution}:{self.resolution}:force_original_aspect_ratio=increase,"
-            f"crop={self.resolution}:{self.resolution},setsar=1"
+            ",".join(filters)
         )
         command = [
             self.ffmpeg_path,
@@ -424,6 +557,9 @@ def build_dataset(config: dict[str, Any]) -> Dataset:
             image_dir=data_config.get("placeholder_image_dir"),
             frame_sampling=data_config.get("frame_sampling", "uniform"),
             normalize_positions=temporal_config.get("normalize_positions", True),
+            center_crop=data_config.get("center_crop", False),
+            random_flip=data_config.get("random_flip", False),
+            image_interpolation_mode=data_config.get("image_interpolation_mode", "lanczos"),
             seed=config.get("training", {}).get("seed", 0),
         )
     if dataset_type == "openvid":
@@ -445,5 +581,8 @@ def build_dataset(config: dict[str, Any]) -> Dataset:
             ffmpeg_path=data_config.get("ffmpeg_path", "ffmpeg"),
             ffmpeg_threads=data_config.get("ffmpeg_threads", 1),
             strict_decode=data_config.get("strict_decode", False),
+            center_crop=data_config.get("center_crop", False),
+            random_flip=data_config.get("random_flip", False),
+            image_interpolation_mode=data_config.get("image_interpolation_mode", "lanczos"),
         )
     raise ValueError(f"Unsupported dataset_type {dataset_type!r}; expected 'placeholder' or 'openvid'.")

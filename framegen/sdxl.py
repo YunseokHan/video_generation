@@ -17,6 +17,7 @@ def encode_prompts_with_sdxl_logic(
     device: torch.device | str,
     dtype: torch.dtype | None = None,
     clip_skip: int | None = None,
+    warn_on_truncation: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Encode prompts with the same hidden-state selection used by SDXL.
 
@@ -52,23 +53,24 @@ def encode_prompts_with_sdxl_logic(
             return_tensors="pt",
         )
         text_input_ids = text_inputs.input_ids
-        untruncated_ids = current_tokenizer(
-            current_prompts,
-            padding="longest",
-            return_tensors="pt",
-        ).input_ids
+        if warn_on_truncation:
+            untruncated_ids = current_tokenizer(
+                current_prompts,
+                padding="longest",
+                return_tensors="pt",
+            ).input_ids
 
-        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
-            text_input_ids, untruncated_ids
-        ):
-            removed_text = current_tokenizer.batch_decode(
-                untruncated_ids[:, current_tokenizer.model_max_length - 1 : -1]
-            )
-            logger.warning(
-                "Prompt was truncated because CLIP can only handle %s tokens: %s",
-                current_tokenizer.model_max_length,
-                removed_text,
-            )
+            if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
+                text_input_ids, untruncated_ids
+            ):
+                removed_text = current_tokenizer.batch_decode(
+                    untruncated_ids[:, current_tokenizer.model_max_length - 1 : -1]
+                )
+                logger.warning(
+                    "Prompt was truncated because CLIP can only handle %s tokens: %s",
+                    current_tokenizer.model_max_length,
+                    removed_text,
+                )
 
         outputs = current_text_encoder(text_input_ids.to(device), output_hidden_states=True)
         pooled_prompt_embeds = outputs[0]

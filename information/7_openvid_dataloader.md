@@ -41,6 +41,9 @@ Returned item:
 frames:          [F, 3, H, W], float32 in [-1, 1]
 caption:         str
 frame_positions: [F], normalized to [0, 1] by default
+original_size:   (original_height, original_width)
+crop_top_left:   (crop_y, crop_x) after resize and optional flip
+target_size:     (H, W)
 ```
 
 `video_collate_fn` stacks these into:
@@ -49,7 +52,15 @@ frame_positions: [F], normalized to [0, 1] by default
 frames:          [B, F, 3, H, W]
 captions:        List[str]
 frame_positions: [B, F]
+original_sizes:  [B, 2]
+crop_top_lefts:  [B, 2]
+target_sizes:    [B, 2]
 ```
+
+`train.py` repeats the three SDXL metadata tensors over `F` and uses them as
+`added_cond_kwargs["time_ids"]`. This is closer to the official SDXL training
+script than the older fixed `(resolution, resolution, 0, 0, resolution,
+resolution)` value.
 
 ## Video Decode Backend
 
@@ -62,8 +73,13 @@ For each sample it:
 1. reads frame count from CSV when available,
 2. selects `F` frame indices with `uniform` or `random` sampling,
 3. runs an `ffmpeg` `select` filter for those indices,
-4. scales and center-crops frames to `model.resolution`,
-5. returns a tensor normalized to SDXL VAE input range `[-1, 1]`.
+4. probes video width/height lazily with `ffprobe` and caches it per worker,
+5. scales frames so the short side reaches `model.resolution`,
+6. applies one video-wide spatial transform:
+   - random crop by default (`data.center_crop: false`)
+   - center crop when `data.center_crop: true`
+   - optional video-wide horizontal flip when `data.random_flip: true`
+7. returns a tensor normalized to SDXL VAE input range `[-1, 1]`.
 
 If metadata frame count is missing, it falls back to `ffprobe`.
 
@@ -86,6 +102,9 @@ data:
   openvid_fallback_caption: "A video."
   num_frames_per_video: 8
   frame_sampling: "uniform"
+  center_crop: false
+  random_flip: false
+  image_interpolation_mode: "lanczos"
   ffmpeg_path: "ffmpeg"
   ffmpeg_threads: 1
   strict_decode: false
@@ -109,6 +128,10 @@ Useful filters:
 
 - `uniform`
 - `random`
+
+`image_interpolation_mode` follows the official SDXL trainer argument and maps
+to ffmpeg scale flags. Supported values are `lanczos`, `bicubic`, `bilinear`,
+and `nearest`.
 
 For 4-GPU training, the default dataloader launches 4 workers per process, so
 up to 16 ffmpeg worker processes can prefetch samples. `ffmpeg_threads: 1`

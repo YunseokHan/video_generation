@@ -2,8 +2,10 @@ accelerate
 diffusers
 transformers
 torch
+torchvision
 Pillow
 PyYAML
 imageio
 wandb
 python-dotenv
+imageio-ffmpeg

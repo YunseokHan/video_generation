@@ -1,17 +1,18 @@
 # Resource Estimates
 
-This file records the current SDXL default-config parameter and VRAM estimates.
+This file records the current SDXL adapter parameter counts and reference VRAM
+estimates.
 The counts were measured by loading
 `stabilityai/stable-diffusion-xl-base-1.0`, injecting the configured adapters,
 and counting module parameters.
 
-## Default Config
+## Current Default Config
 
 ```text
 config:        configs/train/default.yaml
-resolution:    1024
+resolution:    512
 frames/video:  8
-batch/GPU:     1 video = 8 flattened frames
+batch/GPU:     2 videos = 16 flattened frames
 precision:     bf16
 GPUs checked:  4 x NVIDIA B200, 183359 MiB each
 media eval:    disabled by default for throughput
@@ -68,9 +69,11 @@ fp32 AdamW m/v only:     8.49 GiB
 fp32 m/v + master:      12.74 GiB
 ```
 
-## Measured UNet Peak
+## Measured 1024-Scale UNet Peak
 
-A synthetic single-GPU measurement was run for the trainable UNet path only:
+A synthetic single-GPU measurement was run for the trainable UNet path only at
+1024 resolution, 8 frames, and 1 video per GPU. This is a high-water reference,
+not the current 512-resolution default config:
 
 ```text
 latent:       [8, 4, 128, 128]
@@ -115,14 +118,14 @@ longer scale with spatial token count.
 
 ## Dataloader Memory
 
-Each decoded sample at the default shape is:
+Each decoded sample at the current default 512 shape is:
 
 ```text
-[8, 3, 1024, 1024] float32 ~= 96 MiB host memory
+[8, 3, 512, 512] float32 ~= 24 MiB host memory
 ```
 
 With `num_workers: 4`, `prefetch_factor: 2`, and one sample per worker queue,
-each training process can hold roughly 768 MiB of prefetched decoded frame
+each training process can hold roughly 192 MiB of prefetched decoded frame
 tensors, plus ffmpeg buffers. Across 4 GPU processes, budget several GiB of
 pinned host memory. This is intentional to reduce GPU starvation from video
 decode latency.

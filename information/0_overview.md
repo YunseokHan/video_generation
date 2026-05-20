@@ -10,6 +10,8 @@ adapters without replacing the pretrained SDXL backbone.
   - pooled embeddings: `[B, 1280]`
 - Training flattens videos from `[B, F, 3, H, W]` to `[B*F, 3, H, W]`.
 - OpenVid CSV/mp4 data loading is implemented for the local extracted dataset.
+  It returns SDXL resize/crop metadata for `time_ids` and applies video-wide
+  crop/flip transforms.
 - UNet Resnet blocks can be wrapped with temporal convolution and frame
   conditioning adapters.
 - UNet BasicTransformerBlock modules can be wrapped with:
@@ -23,6 +25,14 @@ adapters without replacing the pretrained SDXL backbone.
   - `none`
 - VAE decoder Resnet adapter injection is available through
   `video_adapters.vae_decoder_resnet`.
+- The training loop includes official SDXL trainer options for fp32 VAE encode,
+  fixed external VAE loading, LR scheduling/warmup, gradient clipping,
+  Min-SNR weighting, timestep bias, noise offset, prompt dropout, TF32,
+  xFormers, 8-bit AdamW, and checkpoint resume.
+- Image-first training is implemented through
+  `training.latent_init_mode: "first_frame_repeat"`:
+  repeated first-frame latents are corrupted, while the denoising target is the
+  full ground-truth video latent.
 
 ## Not Fully Implemented
 
@@ -42,11 +52,18 @@ adapters without replacing the pretrained SDXL backbone.
 - `framegen/video_attention.py`: BasicTransformerBlock video adapter.
 - `train.py`: training wiring.
 - `framegen/generation.py`: validation and inference generation wiring.
+- `framegen/image_first_generation.py`: image-only-to-video denoising split
+  used by image-first validation and `infer_image_first.py`.
 - `infer.py`: checkpoint loading and CLI inference.
+- `infer_image_first.py`: checkpoint loading and CLI inference for the
+  first-frame-repeat/image-first denoising path.
 - `test.py`: core shape and adapter smoke tests.
 - `configs/train/`: training, data, logging, and ablation configs.
 - `configs/accelerate/`: Accelerate launcher configs; the default uses 4 GPUs.
 - `scripts/train.sh`: canonical training launcher that selects both config paths.
+- `information/9_loss_and_timestep_schedule.md`: training loss, noise target, and timestep sampling.
+- `information/10_image_first_training.md`: first-frame-repeat objective,
+  validation split, configs, and inference entrypoint.
 
 ## Verified SDXL Backbone
 

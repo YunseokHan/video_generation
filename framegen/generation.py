@@ -12,6 +12,23 @@ from .video_attention import clear_video_attention_context, set_video_attention_
 from .video_resnet import clear_video_resnet_context, set_video_resnet_context
 
 
+def guidance_scale_label(guidance_scale: float) -> str:
+    value = float(guidance_scale)
+    if value.is_integer():
+        text = str(int(value))
+    else:
+        text = f"{value:g}".replace(".", "p").replace("-", "m")
+    return f"cfg_{text}"
+
+
+def write_caption_file(output_dir: str | Path, prompt: str) -> Path:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    caption_path = output_dir / "caption.txt"
+    caption_path.write_text(str(prompt).rstrip() + "\n", encoding="utf-8")
+    return caption_path
+
+
 def _slice_frame_token_context(
     frame_tokens: torch.Tensor | None,
     start: int,
@@ -48,6 +65,7 @@ def generate_video_frames(
 ) -> list[Path]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    write_caption_file(output_dir, prompt)
 
     device = pipe._execution_device
     prompts = [prompt for _ in range(num_frames)]

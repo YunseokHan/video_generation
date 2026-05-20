@@ -1,0 +1,339 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Iterable
+
+import torch
+
+from .data import make_frame_positions
+from .generation import guidance_scale_label, write_caption_file
+from .sdxl import add_temporal_embedding_to_pooled_prompt_embeds, compute_sdxl_time_ids
+from .temporal import apply_frame_token_conditioning
+from .utils import save_image_grid, save_mp4
+from .video_attention import (
+    clear_video_attention_context,
+    iter_video_attention_blocks,
+    set_video_attention_context,
+)
+from .video_resnet import (
+    clear_video_resnet_context,
+    iter_video_resnet_blocks,
+    set_video_resnet_context,
+)
+
+
+def t1_ratio_label(t1_ratio: float) -> str:
+    value = float(t1_ratio)
+    if value.is_integer():
+        text = str(int(value))
+    else:
+        text = f"{value:g}".replace(".", "p").replace("-", "m")
+    return f"t1_{text}"
+
+
+def _snapshot_active_states(blocks: Iterable) -> list[tuple[object, bool]]:
+    return [(block, bool(block.active)) for block in blocks]
+
+
+def _set_active_states(snapshot: list[tuple[object, bool]], active: bool) -> None:
+    for block, _ in snapshot:
+        block.active = bool(active)
+
+
+def _restore_active_states(snapshot: list[tuple[object, bool]]) -> None:
+    for block, active in snapshot:
+        block.active = bool(active)
+
+
+def _prepare_latents(
+    batch_size: int,
+    channels: int,
+    height: int,
+    width: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    generator: torch.Generator | None,
+    scheduler,
+    vae_scale_factor: int,
+) -> torch.Tensor:
+    shape = (batch_size, channels, height // vae_scale_factor, width // vae_scale_factor)
+    latents = torch.randn(shape, generator=generator, device=device, dtype=dtype)
+    return latents * scheduler.init_noise_sigma
+
+
+def _cfg_unet_step(
+    pipe,
+    latents: torch.Tensor,
+    timestep: torch.Tensor,
+    prompt_embeds: torch.Tensor,
+    pooled_prompt_embeds: torch.Tensor,
+    add_time_ids: torch.Tensor,
+    guidance_scale: float,
+    negative_prompt_embeds: torch.Tensor | None,
+    negative_pooled_prompt_embeds: torch.Tensor | None,
+    negative_add_time_ids: torch.Tensor | None,
+) -> torch.Tensor:
+    do_cfg = guidance_scale > 1.0
+    latent_model_input = torch.cat([latents, latents], dim=0) if do_cfg else latents
+    latent_model_input = pipe.scheduler.scale_model_input(latent_model_input, timestep)
+
+    if do_cfg:
+        if negative_prompt_embeds is None or negative_pooled_prompt_embeds is None or negative_add_time_ids is None:
+            raise ValueError("CFG requires negative prompt/text/time embeddings.")
+        encoder_hidden_states = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+        text_embeds = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
+        time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
+    else:
+        encoder_hidden_states = prompt_embeds
+        text_embeds = pooled_prompt_embeds
+        time_ids = add_time_ids
+
+    noise_pred = pipe.unet(
+        latent_model_input,
+        timestep,
+        encoder_hidden_states=encoder_hidden_states,
+        added_cond_kwargs={
+            "text_embeds": text_embeds,
+            "time_ids": time_ids,
+        },
+    ).sample
+    if do_cfg:
+        noise_uncond, noise_text = noise_pred.chunk(2)
+        noise_pred = noise_uncond + float(guidance_scale) * (noise_text - noise_uncond)
+    return noise_pred
+
+
+@torch.inference_mode()
+def generate_image_first_video_frames(
+    pipe,
+    temporal_mlp,
+    frame_position_encoder,
+    prompt: str,
+    num_frames: int,
+    output_dir: str | Path,
+    resolution: int,
+    temporal_alpha: float,
+    t1_ratio: float,
+    guidance_scale: float = 8.0,
+    injection_mode: str = "add_to_pooled_prompt_embeds",
+    frame_token_embedding_mode: str = "temporal_cross_attention_only",
+    frame_token_alpha: float = 1.0,
+    num_inference_steps: int = 30,
+    seed: int | None = None,
+    save_grid: bool = True,
+    save_video: bool = True,
+    fps: int = 8,
+) -> list[Path]:
+    if num_frames <= 0:
+        raise ValueError("num_frames must be positive.")
+    if not 0.0 <= float(t1_ratio) <= 1.0:
+        raise ValueError("t1_ratio must be in [0, 1].")
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_caption_file(output_dir, prompt)
+
+    device = pipe._execution_device
+    dtype = getattr(pipe.unet, "dtype", None)
+    if dtype is None:
+        dtype = next(pipe.unet.parameters()).dtype
+    do_cfg = guidance_scale > 1.0
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=device).manual_seed(int(seed))
+
+    pipe.scheduler.set_timesteps(int(num_inference_steps), device=device)
+    timesteps = pipe.scheduler.timesteps
+    first_stage_steps = min(len(timesteps), max(0, int(round(float(t1_ratio) * len(timesteps)))))
+
+    unet_resnet_state = _snapshot_active_states(iter_video_resnet_blocks(pipe.unet))
+    unet_attention_state = _snapshot_active_states(iter_video_attention_blocks(pipe.unet))
+    vae_decoder = getattr(pipe.vae, "decoder", pipe.vae)
+    vae_resnet_state = _snapshot_active_states(iter_video_resnet_blocks(vae_decoder))
+
+    try:
+        (
+            prompt_embeds_img,
+            negative_prompt_embeds_img,
+            pooled_prompt_embeds_img,
+            negative_pooled_prompt_embeds_img,
+        ) = pipe.encode_prompt(
+            prompt=[prompt],
+            device=device,
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=do_cfg,
+        )
+        add_time_ids_img = compute_sdxl_time_ids(
+            original_size=(resolution, resolution),
+            crop_coords=(0, 0),
+            target_size=(resolution, resolution),
+            batch_size=1,
+            device=device,
+            dtype=pooled_prompt_embeds_img.dtype,
+        )
+
+        latents = _prepare_latents(
+            batch_size=1,
+            channels=int(pipe.unet.config.in_channels),
+            height=int(resolution),
+            width=int(resolution),
+            dtype=dtype,
+            device=device,
+            generator=generator,
+            scheduler=pipe.scheduler,
+            vae_scale_factor=int(pipe.vae_scale_factor),
+        )
+
+        _set_active_states(unet_resnet_state, active=False)
+        _set_active_states(unet_attention_state, active=False)
+        for timestep in timesteps[:first_stage_steps]:
+            noise_pred = _cfg_unet_step(
+                pipe=pipe,
+                latents=latents,
+                timestep=timestep,
+                prompt_embeds=prompt_embeds_img,
+                pooled_prompt_embeds=pooled_prompt_embeds_img,
+                add_time_ids=add_time_ids_img,
+                guidance_scale=guidance_scale,
+                negative_prompt_embeds=negative_prompt_embeds_img,
+                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds_img,
+                negative_add_time_ids=add_time_ids_img if do_cfg else None,
+            )
+            latents = pipe.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
+
+        latents = latents.expand(int(num_frames), -1, -1, -1).contiguous()
+        _restore_active_states(unet_resnet_state)
+        _restore_active_states(unet_attention_state)
+
+        frame_positions = make_frame_positions(num_frames, normalize=True).to(device)
+        frame_adapter_pooled = None
+        frame_adapter_tokens = None
+        frame_attention_tokens = None
+        if frame_position_encoder is not None:
+            frame_adapter_pooled, frame_adapter_tokens = frame_position_encoder(frame_positions)
+
+        prompts = [prompt for _ in range(num_frames)]
+        (
+            prompt_embeds_vid,
+            negative_prompt_embeds_vid,
+            pooled_prompt_embeds_vid,
+            negative_pooled_prompt_embeds_vid,
+        ) = pipe.encode_prompt(
+            prompt=prompts,
+            device=device,
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=do_cfg,
+        )
+        pooled_prompt_embeds_vid, _ = add_temporal_embedding_to_pooled_prompt_embeds(
+            pooled_prompt_embeds=pooled_prompt_embeds_vid,
+            frame_positions=frame_positions,
+            frame_position_mlp=temporal_mlp,
+            alpha=temporal_alpha,
+            injection_mode=injection_mode,
+        )
+        if negative_pooled_prompt_embeds_vid is not None:
+            negative_pooled_prompt_embeds_vid, _ = add_temporal_embedding_to_pooled_prompt_embeds(
+                pooled_prompt_embeds=negative_pooled_prompt_embeds_vid,
+                frame_positions=frame_positions,
+                frame_position_mlp=temporal_mlp,
+                alpha=temporal_alpha,
+                injection_mode=injection_mode,
+            )
+        if frame_position_encoder is not None:
+            prompt_embeds_vid, frame_attention_tokens = apply_frame_token_conditioning(
+                prompt_embeds=prompt_embeds_vid,
+                frame_embeddings=frame_adapter_pooled,
+                frame_tokens=frame_adapter_tokens,
+                num_frames=num_frames,
+                mode=frame_token_embedding_mode,
+                alpha=frame_token_alpha,
+            )
+            if negative_prompt_embeds_vid is not None:
+                negative_prompt_embeds_vid, _ = apply_frame_token_conditioning(
+                    prompt_embeds=negative_prompt_embeds_vid,
+                    frame_embeddings=frame_adapter_pooled,
+                    frame_tokens=frame_adapter_tokens,
+                    num_frames=num_frames,
+                    mode=frame_token_embedding_mode,
+                    alpha=frame_token_alpha,
+                )
+
+        add_time_ids_vid = compute_sdxl_time_ids(
+            original_size=(resolution, resolution),
+            crop_coords=(0, 0),
+            target_size=(resolution, resolution),
+            batch_size=num_frames,
+            device=device,
+            dtype=pooled_prompt_embeds_vid.dtype,
+        )
+
+        set_video_resnet_context(
+            pipe.unet,
+            num_frames=num_frames,
+            frame_positions=frame_positions,
+            frame_embeddings=frame_adapter_pooled,
+        )
+        set_video_attention_context(
+            pipe.unet,
+            num_frames=num_frames,
+            frame_tokens=frame_attention_tokens,
+        )
+        try:
+            for timestep in timesteps[first_stage_steps:]:
+                noise_pred = _cfg_unet_step(
+                    pipe=pipe,
+                    latents=latents,
+                    timestep=timestep,
+                    prompt_embeds=prompt_embeds_vid,
+                    pooled_prompt_embeds=pooled_prompt_embeds_vid,
+                    add_time_ids=add_time_ids_vid,
+                    guidance_scale=guidance_scale,
+                    negative_prompt_embeds=negative_prompt_embeds_vid,
+                    negative_pooled_prompt_embeds=negative_pooled_prompt_embeds_vid,
+                    negative_add_time_ids=add_time_ids_vid if do_cfg else None,
+                )
+                latents = pipe.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
+        finally:
+            clear_video_resnet_context(pipe.unet)
+            clear_video_attention_context(pipe.unet)
+
+        set_video_resnet_context(
+            vae_decoder,
+            num_frames=num_frames,
+            frame_positions=frame_positions,
+            frame_embeddings=frame_adapter_pooled,
+        )
+        try:
+            image = pipe.vae.decode(latents / pipe.vae.config.scaling_factor, return_dict=False)[0]
+        finally:
+            clear_video_resnet_context(vae_decoder)
+        images = pipe.image_processor.postprocess(image, output_type="pil")
+    finally:
+        _restore_active_states(unet_resnet_state)
+        _restore_active_states(unet_attention_state)
+        _restore_active_states(vae_resnet_state)
+
+    output_paths: list[Path] = []
+    for index, image in enumerate(images):
+        path = output_dir / f"frame_{index:03d}.png"
+        image.save(path)
+        output_paths.append(path)
+
+    if save_grid:
+        save_image_grid(images, output_dir / "grid.png")
+    if save_video:
+        ok = save_mp4(images, output_dir / "video.mp4", fps=fps)
+        if not ok:
+            print("MP4 export failed; skipped video.mp4.")
+    metadata = (
+        f"prompt: {prompt}\n"
+        f"t1_ratio: {float(t1_ratio):g}\n"
+        f"guidance_scale: {float(guidance_scale):g}\n"
+        f"num_inference_steps: {int(num_inference_steps)}\n"
+    )
+    (output_dir / "image_first_metadata.txt").write_text(metadata, encoding="utf-8")
+    return output_paths
+
+
+def image_first_output_dir(root: str | Path, t1_ratio: float, guidance_scale: float) -> Path:
+    return Path(root) / t1_ratio_label(t1_ratio) / guidance_scale_label(guidance_scale)

@@ -4,7 +4,8 @@
 
 The training script is `train.py` at the repository root.
 
-1. Load SDXL pipeline, tokenizer, text encoders, VAE, and UNet.
+1. Load SDXL pipeline, tokenizer, text encoders, UNet, and a separately loaded
+   SDXL VAE.
 2. Inject configured adapters:
    - `video_adapters.resnet` into UNet Resnet blocks
    - `video_adapters.attention` into UNet BasicTransformerBlock modules
@@ -20,10 +21,17 @@ captions:        B captions -> B*F repeated captions
 frame_positions: [B, F] -> [B*F]
 ```
 
-5. Encode frames with VAE encoder and prompts with SDXL two-encoder logic.
+5. Encode frames with the VAE encoder in `model.vae_dtype` and prompts with
+   SDXL two-encoder logic.
 6. Apply pooled frame conditioning.
 7. Apply token embedding mode if `frame_position_encoder.enabled=true`.
 8. Set UNet video adapter context and run denoising loss.
+
+If `training.latent_init_mode: "first_frame_repeat"`, step 5 still VAE-encodes
+all frames to ground-truth latents, but the forward noising source is changed to
+the first frame latent repeated over `F`. The loss target remains the full
+ground-truth video latent through an effective epsilon target. See
+`information/10_image_first_training.md`.
 
 When text encoders are frozen, `train.py` encodes each video caption once at
 `[B, 77, 2048]` and repeats the resulting embeddings across frames on GPU.
@@ -86,16 +94,98 @@ The training dataloader uses pinned host memory and non-blocking host-to-device
 copies when `data.pin_memory=true`. With `num_workers>0`, it also enables
 persistent workers and prefetching from config.
 
-Default configs keep validation generation and training-caption inference
-disabled for throughput. They remain available through
-`validation.enabled=true` and `logging.log_training_caption_inference=true`
-when media logging is needed.
+The VAE is loaded through `AutoencoderKL.from_pretrained(...)` instead of
+reusing the bf16 pipeline copy. By default `model.vae_dtype: "fp32"`, matching
+the official SDXL trainer's stability choice. Set
+`model.pretrained_vae_model_name_or_path` to use an external fixed VAE such as
+`madebyollin/sdxl-vae-fp16-fix`.
+
+The following official SDXL trainer options are config-backed in `train.py`:
+
+```yaml
+model:
+  pretrained_vae_model_name_or_path: null
+  revision: null
+  variant: null
+  vae_dtype: "fp32"
+
+data:
+  center_crop: false
+  random_flip: false
+  image_interpolation_mode: "lanczos"
+
+training:
+  scale_lr: false
+  lr_scheduler: "constant"
+  lr_warmup_steps: 500
+  num_train_epochs: 100
+  gradient_checkpointing: false
+  allow_tf32: false
+  enable_xformers_memory_efficient_attention: false
+  use_8bit_adam: false
+  max_grad_norm: 1.0
+  prediction_type: null
+  noise_offset: 0.0
+  snr_gamma: null
+  timestep_bias_strategy: "none"
+  timestep_bias_multiplier: 1.0
+  timestep_bias_begin: 0
+  timestep_bias_end: 1000
+  timestep_bias_portion: 0.25
+  proportion_empty_prompts: 0.0
+  checkpoints_total_limit: null
+  resume_from_checkpoint: null
+  logging_dir: "logs"
+```
+
+The option names and defaults mirror the official SDXL script where they apply
+cleanly. The experiment configs may still choose smaller video-safe values for
+fields like `train_batch_size`, `resolution`, or `learning_rate`.
+
+The main process shows one `tqdm` progress bar at the bottom of the terminal.
+Its postfix reports recent loss, learning rate, epoch progress, seen frame
+count, and peak GPU memory. Status messages such as checkpoint saves are written
+through the progress bar so they do not break the live display.
+
+The current default configs enable checkpoint validation every 1000 optimizer
+steps and keep training-caption inference disabled for throughput.
+Training-caption media remains available through
+`logging.log_training_caption_inference=true`.
 
 Default configs also set `training.train_unet=false`. The base SDXL UNet is
 frozen; only the added UNet Resnet adapters, UNet attention adapters, temporal
 pooled MLP, and enabled frame-token encoder parameters are optimized. The VAE
 decoder adapter remains active for decode/inference compatibility but is not
 trained by the current denoising-only objective.
+
+Image-first configs are available at:
+
+```text
+configs/train/image_first_sinusoidal.yaml
+configs/train/image_first_learnable_frame_tokens.yaml
+```
+
+Launch them with:
+
+```bash
+bash scripts/train_image_first.sh
+bash scripts/train_image_first_learnable.sh
+```
+
+These configs validate with CFG 8 only and run `t1` ratios
+`0, 0.25, 0.5, 0.75`.
+
+`global_step` is an optimizer-step counter, not a dataloader microbatch counter.
+With `train_batch_size: 1`, `gradient_accumulation_steps: 4`,
+`num_frames_per_video: 8`, and 4 Accelerate processes, one logged optimization
+step aggregates 16 videos and 128 frames. With the current
+`configs/train/default.yaml` value `train_batch_size: 2`, that becomes 32
+videos and 256 frames per optimizer step. `train/loss` is averaged over the
+local accumulation window and then averaged across processes before logging.
+
+Prompt tokenization still truncates captions to the SDXL tokenizer max length,
+but repeated truncation warnings are disabled by default to keep large-dataset
+training logs readable.
 
 ## Inference Flow
 
@@ -120,20 +210,101 @@ Generation uses `framegen/generation.py`:
 6. Set context on UNet adapters and VAE decoder adapters for each chunk.
 7. Save `frame_000.png`, `grid.png`, and optionally `video.mp4`.
 
+MP4 export first tries `imageio.v3`. If the environment has `imageio` but not
+an MP4 writer backend such as `imageio_ffmpeg`, `framegen.utils.save_mp4`
+falls back to the system `ffmpeg` binary with `libx264` and `yuv420p` output.
+If both paths fail, it prints the backend error instead of silently swallowing
+the cause.
+
+For checkpoint-only validation on another server, `infer.py` can resolve the
+checkpoint and output path from an experiment name and step:
+
+```bash
+python infer.py \
+  --name sdxl-resnet-attention-sinusoidal \
+  --step 1000 \
+  --prompt "Astronaut walking through a jungle, cold color palette" \
+  --num_frames 16
+```
+
+This loads:
+
+```text
+outputs/sdxl-resnet-attention-sinusoidal/checkpoint-1000
+```
+
+and writes:
+
+```text
+outputs/infer/sdxl-resnet-attention-sinusoidal-1000/
+  cfg_1/
+    caption.txt
+    frame_000.png
+    ...
+    grid.png
+    video.mp4
+  cfg_8/
+    caption.txt
+    frame_000.png
+    ...
+    grid.png
+    video.mp4
+```
+
+`--step last` maps to `checkpoint-last`. `--checkpoint` and `--output_dir`
+remain available for arbitrary paths. When `--config` is omitted, inference
+first reads `checkpoint/config.yaml`, falling back to
+`configs/train/default.yaml` only if the checkpoint does not carry a config.
+Use `--guidance_scale 8` for one CFG value, or `--guidance_scales 1 8` for
+explicit multi-CFG output. The default multi-CFG inference path uses CFG 1 and
+CFG 8. Each generated folder writes the actual prompt to `caption.txt`.
+
+Image-first inference is intentionally separate from `infer.py`:
+
+```bash
+python infer_image_first.py \
+  --name image-first-sinusoidal-res512-bs5 \
+  --step 1000 \
+  --prompt "A dog running through a grassy field, cinematic lighting" \
+  --num_frames 8 \
+  --t1 0.25 \
+  --guidance_scale 8
+```
+
+It performs base-image denoising with adapters off for
+`round(t1 * num_inference_steps)` scheduler steps, repeats the current image
+latent to all frames, restores adapter active states, and completes denoising as
+a video. Outputs are saved under:
+
+```text
+outputs/infer_image_first/{name}-{step}/t1_*/cfg_*/
+```
+
 ## Checkpoint Files
 
 ```text
 checkpoint-N/
   unet/
+  accelerator_state/
   temporal_mlp.pt
   frame_position_encoder.pt
   resnet_video_adapter.pt
   attention_video_adapter.pt
   vae_decoder_video_adapter.pt
   config.yaml
+  trainer_state.json
 ```
 
-Only files for enabled/present modules are written.
+Only files for enabled/present modules are written. `accelerator_state/` stores
+optimizer, scheduler, model wrapper, and RNG state for exact resume. Use:
+
+```yaml
+training:
+  resume_from_checkpoint: "latest"
+```
+
+or point it to `checkpoint-N` / `checkpoint-last`. `checkpoints_total_limit`
+rotates numbered checkpoints while preserving the latest checkpoint-last copy.
 
 ## Tests
 
@@ -166,11 +337,35 @@ train/lr
 train/epoch
 train/global_step
 train/samples_seen_frames
+train/effective_batch_videos
+train/effective_batch_frames
 system/gpu_max_memory_allocated_mb
 params/trainable
 params/frozen
 checkpoint/saved_step
 ```
+
+Default validation config:
+
+```yaml
+training:
+  validation_steps: 1000
+
+logging:
+  log_validation_media: true
+
+validation:
+  enabled: true
+  num_frames: 8
+  save_grid: true
+  save_mp4: true
+  guidance_scales: [1.0, 8.0]
+```
+
+Every 1000 optimizer steps, the main process generates one validation video per
+configured CFG scale and logs separate `validation/cfg_1/video` and
+`validation/cfg_8/video` artifacts to W&B when `logging.report_to` includes
+`wandb`. The same prompt is saved as `caption.txt` in each CFG folder.
 
 Training-caption inference is controlled by:
 

@@ -26,11 +26,26 @@ latents = latents * vae.config.scaling_factor
 The repository relies on the model config rather than hard-coding the SDXL
 constant.
 
+For SDXL stability, `train.py` reloads the VAE separately with
+`AutoencoderKL.from_pretrained(...)` and keeps it in fp32 by default:
+
+```yaml
+model:
+  pretrained_vae_model_name_or_path: null
+  vae_dtype: "fp32"
+```
+
+When `pretrained_vae_model_name_or_path` is `null`, the VAE is loaded from the
+base SDXL model's `vae` subfolder. Setting it to an external model path enables
+the same fixed-VAE workflow supported by the official SDXL trainer.
+
 ## Implemented In This Repo
 
 - The training loop uses the VAE encoder to convert flattened frames
   `[B*F, 3, H, W]` into diffusion latents `[B*F, 4, H/8, W/8]`.
 - The default training objective does not train the VAE.
+- Input frames are moved to `model.vae_dtype` for VAE encode; noisy latents are
+  cast back to `model.dtype` before the UNet forward pass.
 - VAE decoder Resnet surgery is available through:
 
 ```yaml
