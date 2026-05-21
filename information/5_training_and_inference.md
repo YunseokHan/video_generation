@@ -57,6 +57,13 @@ configs/accelerate/default.yaml
 `configs/train/` contains model, data, optimizer, logging, and ablation
 settings. `configs/accelerate/` contains Accelerate launch settings.
 
+All YAML files under `configs/train/` intentionally share the same recursive
+key schema. Ablation-specific fields are still present in configs that do not
+use them; for example, `training.image_first_noise_mode` is ignored when
+`training.latent_init_mode: "video_gt"`, and `validation.guidance_scales` is
+ignored by image-first validation, which uses `validation.guidance_scale` and
+`validation.t1_ratios`.
+
 `configs/accelerate/default.yaml` is the default launcher config for
 `scripts/train.sh` and uses 4 GPU processes:
 
@@ -161,6 +168,7 @@ trained by the current denoising-only objective.
 Image-first configs are available at:
 
 ```text
+configs/train/image_first_mixed.yaml
 configs/train/image_first_sinusoidal.yaml
 configs/train/image_first_learnable_frame_tokens.yaml
 ```
@@ -169,18 +177,28 @@ Launch them with:
 
 ```bash
 bash scripts/train_image_first.sh
+bash scripts/train_image_first_sinusoidal.sh
 bash scripts/train_image_first_learnable.sh
 ```
 
 These configs validate with CFG 8 only and run `t1` ratios
 `0, 0.25, 0.5, 0.75`.
 
+`scripts/train_image_first.sh` launches `configs/train/image_first_mixed.yaml`.
+That config is named `image-first-mixed` and uses mixed image-first noise:
+per video, 50% frame-shared noise and 50% frame-independent noise.
+
+`scripts/train_image_first_sinusoidal.sh` launches
+`configs/train/image_first_sinusoidal.yaml`. It keeps the original
+frame-independent training noise while using the same image-first validation
+path and default `validation.switch_noise_scale: 0.1`.
+
 `global_step` is an optimizer-step counter, not a dataloader microbatch counter.
 With `train_batch_size: 1`, `gradient_accumulation_steps: 4`,
 `num_frames_per_video: 8`, and 4 Accelerate processes, one logged optimization
 step aggregates 16 videos and 128 frames. With the current
-`configs/train/default.yaml` value `train_batch_size: 2`, that becomes 32
-videos and 256 frames per optimizer step. `train/loss` is averaged over the
+`configs/train/default.yaml` value `train_batch_size: 5`, that becomes 80
+videos and 640 frames per optimizer step. `train/loss` is averaged over the
 local accumulation window and then averaged across processes before logging.
 
 Prompt tokenization still truncates captions to the SDXL tokenizer max length,
@@ -268,17 +286,23 @@ python infer_image_first.py \
   --prompt "A dog running through a grassy field, cinematic lighting" \
   --num_frames 8 \
   --t1 0.25 \
-  --guidance_scale 8
+  --guidance_scale 8 \
+  --switch_noise_scale 0.1
 ```
 
 It performs base-image denoising with adapters off for
 `round(t1 * num_inference_steps)` scheduler steps, repeats the current image
-latent to all frames, restores adapter active states, and completes denoising as
-a video. Outputs are saved under:
+latent to all frames, optionally adds small frame-wise switch noise, restores
+adapter active states, and completes denoising as a video. Outputs are saved
+under:
 
 ```text
 outputs/infer_image_first/{name}-{step}/t1_*/cfg_*/
 ```
+
+`validation.switch_noise_scale` controls the training-time image-first
+validation default. Image-first configs set it to `0.1`; omit or set `0.0` to
+use exact latent duplication.
 
 ## Checkpoint Files
 

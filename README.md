@@ -93,10 +93,16 @@ Learnable frame-token ablation:
 TRAIN_CONFIG=configs/train/learnable_frame_tokens.yaml bash scripts/train.sh
 ```
 
-Image-first sinusoidal training:
+Image-first mixed-noise sinusoidal training:
 
 ```bash
 bash scripts/train_image_first.sh
+```
+
+Image-first sinusoidal training without mixed training noise:
+
+```bash
+bash scripts/train_image_first_sinusoidal.sh
 ```
 
 Image-first learnable frame-token ablation:
@@ -122,15 +128,25 @@ bash scripts/train_image_first_learnable.sh
 changes frame-wise token embedding to learned tokens with
 `token_embedding_mode: concat_tokens`.
 
-`configs/train/image_first_sinusoidal.yaml` and
+`configs/train/image_first_mixed.yaml`,
+`configs/train/image_first_sinusoidal.yaml`, and
 `configs/train/image_first_learnable_frame_tokens.yaml` set
 `training.latent_init_mode: "first_frame_repeat"`. In this mode training
 corrupts repeated first-frame latents while the objective denoises to the full
 ground-truth video latent. Validation runs CFG 8 at `t1` ratios
 `0, 0.25, 0.5, 0.75`.
 
+`configs/train/image_first_mixed.yaml` is the default image-first launcher
+config. It uses `training.image_first_noise_mode: "mixed"` with
+`image_first_shared_noise_prob: 0.5`, so half of the videos use frame-shared
+noise and half use frame-independent noise.
+
 `configs/accelerate/default.yaml` is the default multi-GPU launcher config and
 uses 4 GPU processes (`gpu_ids: "0,1,2,3"`).
+
+All files under `configs/train/` share the same key schema. Some keys are
+ablation-specific and ignored outside their mode, but they remain present so
+future edits can diff configs by value instead of by structure.
 
 ## Train
 
@@ -245,7 +261,8 @@ python infer_image_first.py \
   --prompt "Astronaut walking through a jungle, cold color palette" \
   --num_frames 8 \
   --t1 0.25 \
-  --guidance_scale 8
+  --guidance_scale 8 \
+  --switch_noise_scale 0.1
 ```
 
 It writes to `outputs/infer_image_first/{name}-{step}/t1_*/cfg_*/` and keeps

@@ -77,6 +77,9 @@ from framegen.video_resnet import (
 
 LATENT_INIT_VIDEO_GT = "video_gt"
 LATENT_INIT_FIRST_FRAME_REPEAT = "first_frame_repeat"
+IMAGE_FIRST_NOISE_INDEPENDENT = "independent"
+IMAGE_FIRST_NOISE_SHARED = "shared"
+IMAGE_FIRST_NOISE_MIXED = "mixed"
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,6 +107,27 @@ def normalize_latent_init_mode(mode: str | None) -> str:
     if normalized not in aliases:
         raise ValueError(
             "training.latent_init_mode must be one of video_gt or first_frame_repeat, "
+            f"got {mode!r}."
+        )
+    return aliases[normalized]
+
+
+def normalize_image_first_noise_mode(mode: str | None) -> str:
+    normalized = str(mode or IMAGE_FIRST_NOISE_INDEPENDENT).lower().replace("-", "_")
+    aliases = {
+        "": IMAGE_FIRST_NOISE_INDEPENDENT,
+        "default": IMAGE_FIRST_NOISE_INDEPENDENT,
+        "independent": IMAGE_FIRST_NOISE_INDEPENDENT,
+        "frame_independent": IMAGE_FIRST_NOISE_INDEPENDENT,
+        "shared": IMAGE_FIRST_NOISE_SHARED,
+        "same": IMAGE_FIRST_NOISE_SHARED,
+        "same_noise": IMAGE_FIRST_NOISE_SHARED,
+        "mixed": IMAGE_FIRST_NOISE_MIXED,
+        "mix": IMAGE_FIRST_NOISE_MIXED,
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "training.image_first_noise_mode must be one of independent, shared, or mixed, "
             f"got {mode!r}."
         )
     return aliases[normalized]
@@ -301,6 +325,62 @@ def repeat_first_frame_latents(latents: torch.Tensor, batch_size: int, num_frame
     video_latents = latents.reshape(int(batch_size), int(num_frames), *latents.shape[1:])
     anchor = video_latents[:, :1].expand(-1, int(num_frames), -1, -1, -1)
     return anchor.reshape_as(latents)
+
+
+def sample_image_first_noise(
+    reference: torch.Tensor,
+    batch_size: int,
+    num_frames: int,
+    noise_mode: str,
+    shared_noise_prob: float,
+    noise_offset: float,
+) -> tuple[torch.Tensor, float]:
+    if reference.shape[0] != int(batch_size) * int(num_frames):
+        raise ValueError(
+            "reference must be flattened [B*F, C, H, W], got "
+            f"{tuple(reference.shape)} for B={batch_size}, F={num_frames}."
+        )
+    mode = normalize_image_first_noise_mode(noise_mode)
+    probability = float(shared_noise_prob)
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("training.image_first_shared_noise_prob must be in [0, 1].")
+
+    batch_size = int(batch_size)
+    num_frames = int(num_frames)
+    shape = reference.shape[1:]
+    independent = torch.randn_like(reference).reshape(batch_size, num_frames, *shape)
+    shared = torch.randn(
+        (batch_size, 1, *shape),
+        device=reference.device,
+        dtype=reference.dtype,
+    ).expand(-1, num_frames, -1, -1, -1)
+
+    if mode == IMAGE_FIRST_NOISE_SHARED:
+        mask = torch.ones(batch_size, 1, 1, 1, 1, device=reference.device, dtype=torch.bool)
+    elif mode == IMAGE_FIRST_NOISE_MIXED:
+        mask = (
+            torch.rand(batch_size, 1, 1, 1, 1, device=reference.device)
+            < probability
+        )
+    else:
+        mask = torch.zeros(batch_size, 1, 1, 1, 1, device=reference.device, dtype=torch.bool)
+
+    noise = torch.where(mask, shared, independent)
+    if float(noise_offset) != 0.0:
+        independent_offset = torch.randn(
+            (batch_size, num_frames, shape[0], 1, 1),
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        shared_offset = torch.randn(
+            (batch_size, 1, shape[0], 1, 1),
+            device=reference.device,
+            dtype=reference.dtype,
+        ).expand(-1, num_frames, -1, -1, -1)
+        offset_noise = torch.where(mask, shared_offset, independent_offset)
+        noise = noise + float(noise_offset) * offset_noise
+
+    return noise.reshape_as(reference), mask.float().mean().item()
 
 
 def compute_clean_latent_epsilon_target(
@@ -872,6 +952,8 @@ def main() -> None:
     training_config.setdefault("prediction_type", None)
     training_config.setdefault("noise_offset", 0.0)
     training_config.setdefault("latent_init_mode", LATENT_INIT_VIDEO_GT)
+    training_config.setdefault("image_first_noise_mode", IMAGE_FIRST_NOISE_INDEPENDENT)
+    training_config.setdefault("image_first_shared_noise_prob", 0.5)
     training_config.setdefault("proportion_empty_prompts", 0.0)
     training_config.setdefault("logging_dir", "logs")
     temporal_config = dict(config["temporal_conditioning"])
@@ -959,6 +1041,13 @@ def main() -> None:
         noise_scheduler.register_to_config(prediction_type=training_config["prediction_type"])
     latent_init_mode = normalize_latent_init_mode(training_config.get("latent_init_mode"))
     training_config["latent_init_mode"] = latent_init_mode
+    image_first_noise_mode = normalize_image_first_noise_mode(
+        training_config.get("image_first_noise_mode")
+    )
+    training_config["image_first_noise_mode"] = image_first_noise_mode
+    image_first_shared_noise_prob = float(training_config.get("image_first_shared_noise_prob", 0.5))
+    if not 0.0 <= image_first_shared_noise_prob <= 1.0:
+        raise ValueError("training.image_first_shared_noise_prob must be in [0, 1].")
     if (
         latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT
         and getattr(noise_scheduler.config, "prediction_type", "epsilon") != "epsilon"
@@ -1281,9 +1370,18 @@ def main() -> None:
                             batch_size=batch_size,
                             num_frames=num_frames,
                         )
-
-                    noise = torch.randn_like(noising_latents)
-                    noise = add_noise_offset(noise, float(training_config.get("noise_offset", 0.0)))
+                        noise, image_first_shared_noise_fraction = sample_image_first_noise(
+                            reference=noising_latents,
+                            batch_size=batch_size,
+                            num_frames=num_frames,
+                            noise_mode=image_first_noise_mode,
+                            shared_noise_prob=image_first_shared_noise_prob,
+                            noise_offset=float(training_config.get("noise_offset", 0.0)),
+                        )
+                    else:
+                        image_first_shared_noise_fraction = 0.0
+                        noise = torch.randn_like(noising_latents)
+                        noise = add_noise_offset(noise, float(training_config.get("noise_offset", 0.0)))
                     timesteps = sample_video_timesteps(
                         batch_size=batch_size,
                         num_frames=num_frames,
@@ -1362,6 +1460,16 @@ def main() -> None:
                                 "latents": tuple(latents.shape),
                                 "noising_latents": tuple(noising_latents.shape),
                                 "latent_init_mode": latent_init_mode,
+                                "image_first_noise_mode": (
+                                    image_first_noise_mode
+                                    if latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT
+                                    else None
+                                ),
+                                "image_first_shared_noise_fraction": (
+                                    image_first_shared_noise_fraction
+                                    if latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT
+                                    else None
+                                ),
                                 "video_timesteps": tuple(timesteps.reshape(batch_size, num_frames)[:, 0].shape),
                                 "timesteps": tuple(timesteps.shape),
                                 "prompt_embeds": tuple(prompt_embeds.shape),
@@ -1492,6 +1600,11 @@ def main() -> None:
                             "train/effective_batch_videos": effective_batch_videos,
                             "train/effective_batch_frames": effective_batch_frames,
                         }
+                        if latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT:
+                            metrics["train/image_first_shared_noise_fraction"] = (
+                                image_first_shared_noise_fraction
+                            )
+                            metrics["train/image_first_shared_noise_prob"] = image_first_shared_noise_prob
                         if gpu_memory_mb is not None:
                             metrics["system/gpu_max_memory_allocated_mb"] = gpu_memory_mb
                         if tracker_is_enabled(config):
@@ -1571,6 +1684,7 @@ def main() -> None:
                             )
                             if latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT:
                                 guidance_scale = float(validation_config.get("guidance_scale", 8.0))
+                                switch_noise_scale = float(validation_config.get("switch_noise_scale", 0.1))
                                 guidance_label = guidance_scale_label(guidance_scale)
                                 t1_ratios = config_float_list(
                                     validation_config.get("t1_ratios", [0.0, 0.25, 0.5, 0.75])
@@ -1601,6 +1715,7 @@ def main() -> None:
                                         save_grid=bool(validation_config.get("save_grid", True)),
                                         save_video=bool(validation_config.get("save_mp4", False)),
                                         fps=int(validation_config.get("fps", 8)),
+                                        switch_noise_scale=switch_noise_scale,
                                     )
                                     write_status(
                                         accelerator,
@@ -1616,6 +1731,9 @@ def main() -> None:
                                                 ),
                                                 f"validation/{t1_label}/{guidance_label}/guidance_scale": guidance_scale,
                                                 f"validation/{t1_label}/{guidance_label}/t1_ratio": float(t1_ratio),
+                                                f"validation/{t1_label}/{guidance_label}/switch_noise_scale": (
+                                                    switch_noise_scale
+                                                ),
                                             },
                                             step=global_step,
                                         )

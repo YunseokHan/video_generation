@@ -61,6 +61,30 @@ def _prepare_latents(
     return latents * scheduler.init_noise_sigma
 
 
+def _scheduler_switch_noise_level(
+    scheduler,
+    timesteps: torch.Tensor,
+    step_index: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if step_index >= len(timesteps):
+        return torch.zeros((), device=device, dtype=dtype)
+    sigmas = getattr(scheduler, "sigmas", None)
+    if sigmas is not None:
+        sigma_index = min(int(step_index), int(sigmas.shape[0]) - 1)
+        return sigmas[sigma_index].to(device=device, dtype=dtype)
+
+    alphas_cumprod = getattr(scheduler, "alphas_cumprod", None)
+    if alphas_cumprod is not None:
+        timestep = timesteps[step_index].to(device=alphas_cumprod.device).long()
+        timestep = timestep.clamp(0, alphas_cumprod.shape[0] - 1)
+        alpha_prod = alphas_cumprod[timestep].to(device=device, dtype=dtype)
+        return (1.0 - alpha_prod).clamp_min(0.0).sqrt()
+
+    return torch.ones((), device=device, dtype=dtype)
+
+
 def _cfg_unet_step(
     pipe,
     latents: torch.Tensor,
@@ -123,11 +147,14 @@ def generate_image_first_video_frames(
     save_grid: bool = True,
     save_video: bool = True,
     fps: int = 8,
+    switch_noise_scale: float = 0.1,
 ) -> list[Path]:
     if num_frames <= 0:
         raise ValueError("num_frames must be positive.")
     if not 0.0 <= float(t1_ratio) <= 1.0:
         raise ValueError("t1_ratio must be in [0, 1].")
+    if float(switch_noise_scale) < 0.0:
+        raise ValueError("switch_noise_scale must be non-negative.")
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -202,6 +229,21 @@ def generate_image_first_video_frames(
             latents = pipe.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
 
         latents = latents.expand(int(num_frames), -1, -1, -1).contiguous()
+        if float(switch_noise_scale) > 0.0 and first_stage_steps < len(timesteps):
+            switch_noise_level = _scheduler_switch_noise_level(
+                scheduler=pipe.scheduler,
+                timesteps=timesteps,
+                step_index=first_stage_steps,
+                device=device,
+                dtype=latents.dtype,
+            )
+            switch_noise = torch.randn(
+                latents.shape,
+                generator=generator,
+                device=device,
+                dtype=latents.dtype,
+            )
+            latents = latents + float(switch_noise_scale) * switch_noise_level * switch_noise
         _restore_active_states(unet_resnet_state)
         _restore_active_states(unet_attention_state)
 
@@ -330,6 +372,7 @@ def generate_image_first_video_frames(
         f"t1_ratio: {float(t1_ratio):g}\n"
         f"guidance_scale: {float(guidance_scale):g}\n"
         f"num_inference_steps: {int(num_inference_steps)}\n"
+        f"switch_noise_scale: {float(switch_noise_scale):g}\n"
     )
     (output_dir / "image_first_metadata.txt").write_text(metadata, encoding="utf-8")
     return output_paths

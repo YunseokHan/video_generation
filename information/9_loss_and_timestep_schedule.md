@@ -133,6 +133,20 @@ z_t = q(z_t | noising_latents)
 Noise is still independent per flattened frame, while timesteps are shared per
 video as described above.
 
+`training.image_first_noise_mode` controls this noise only for
+`first_frame_repeat`:
+
+```yaml
+training:
+  image_first_noise_mode: "independent"  # independent | shared | mixed
+  image_first_shared_noise_prob: 0.5
+```
+
+`shared` uses one Gaussian noise tensor per video and repeats it over all
+frames. `mixed` chooses shared noise for each video with
+`image_first_shared_noise_prob` and otherwise uses frame-independent noise.
+`configs/train/image_first_mixed.yaml` sets `mixed` with probability `0.5`.
+
 ## Prediction Target
 
 The UNet receives:

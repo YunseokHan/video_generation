@@ -48,8 +48,8 @@ first frame latent per video, and repeats it across `F`:
 noising_latents = [z*1, z*1, ..., z*1]
 ```
 
-Timesteps are still sampled once per video and repeated across frames. Noise is
-independent per frame:
+Timesteps are still sampled once per video and repeated across frames. The
+default non-mixed mode uses independent noise per frame:
 
 ```text
 t:       [B] -> [B*F]
@@ -57,6 +57,26 @@ epsilon: [B*F, 4, H/8, W/8]
 z_t = sqrt(alpha_bar_t) * noising_latents
     + sqrt(1 - alpha_bar_t) * epsilon
 ```
+
+The `image-first-mixed` config instead uses mixed noise sampling:
+
+```yaml
+training:
+  image_first_noise_mode: "mixed"   # independent | shared | mixed
+  image_first_shared_noise_prob: 0.5
+```
+
+For each video, `mixed` samples whether the video uses frame-independent noise
+or frame-shared noise. Shared mode samples one noise tensor per video and
+repeats it over frames:
+
+```text
+epsilon: [B, 1, 4, H/8, W/8] -> [B, F, 4, H/8, W/8]
+```
+
+This makes part of training match the image-first inference switch point, where
+all frames start from the same duplicated latent. The target definition stays
+the same.
 
 Because the model is trained to denoise `z_t` to the full ground-truth video
 latent `z*`, the epsilon target is not the sampled `epsilon`. It is the epsilon
@@ -83,6 +103,7 @@ Validation uses:
 validation:
   guidance_scale: 8.0
   t1_ratios: [0.0, 0.25, 0.5, 0.75]
+  switch_noise_scale: 0.1
 ```
 
 For each `t1_ratio`, the denoising schedule is split as:
@@ -100,6 +121,13 @@ Stage 1:
 Stage 2:
 
 - the current image latent is repeated to `[F, 4, H/8, W/8]`,
+- small frame-wise switch noise is optionally added:
+
+```text
+z_switch^f = z_img + switch_noise_scale * sigma_switch * eta^f
+```
+
+- `sigma_switch` is read from the inference scheduler if available,
 - adapter active states are restored,
 - frame positions, pooled frame conditioning, and frame-token conditioning are
   applied,
@@ -147,6 +175,10 @@ The final generated media is placed under:
 t1_0p25/cfg_8/
 ```
 
+`--switch_noise_scale` overrides `validation.switch_noise_scale`; the default
+fallback is `0.1`. Set it to `0.0` to recover exact latent duplication at the
+switch point.
+
 `--step last` maps to `checkpoint-last`. `--checkpoint` and `--output_dir` are
 available for copied checkpoint folders on another server. If `--config` is not
 given, the script first reads `checkpoint/config.yaml`, which keeps copied
@@ -154,7 +186,7 @@ checkpoints portable.
 
 ## Configs And Scripts
 
-Sinusoidal frame embedding:
+Mixed-noise sinusoidal frame embedding:
 
 ```bash
 bash scripts/train_image_first.sh
@@ -163,7 +195,25 @@ bash scripts/train_image_first.sh
 uses:
 
 ```text
+configs/train/image_first_mixed.yaml
+```
+
+This run is named `image-first-mixed` and writes to:
+
+```text
+outputs/image-first-mixed
+```
+
+The non-mixed sinusoidal config remains available at:
+
+```text
 configs/train/image_first_sinusoidal.yaml
+```
+
+Run it directly with:
+
+```bash
+bash scripts/train_image_first_sinusoidal.sh
 ```
 
 Learnable frame-token ablation:

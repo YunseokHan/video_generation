@@ -33,6 +33,11 @@ adapters without replacing the pretrained SDXL backbone.
   `training.latent_init_mode: "first_frame_repeat"`:
   repeated first-frame latents are corrupted, while the denoising target is the
   full ground-truth video latent.
+- `configs/train/image_first_mixed.yaml` adds mixed image-first noising:
+  per video, some samples use frame-shared noise and the rest use
+  frame-independent noise.
+- Image-first validation/inference supports `switch_noise_scale`, which adds
+  small frame-wise perturbation after duplicating the image latent.
 
 ## Not Fully Implemented
 

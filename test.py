@@ -21,9 +21,14 @@ from framegen.data import (
     make_frame_positions,
     video_collate_fn,
 )
+from framegen.config import load_config
 from framegen.env import get_hf_cache_dir, get_hf_token, load_env_file
 from framegen.generation import guidance_scale_label, write_caption_file
-from framegen.image_first_generation import image_first_output_dir, t1_ratio_label
+from framegen.image_first_generation import (
+    _scheduler_switch_noise_level,
+    image_first_output_dir,
+    t1_ratio_label,
+)
 from framegen.utils import save_mp4
 from framegen.sdxl import (
     add_temporal_embedding_to_pooled_prompt_embeds,
@@ -42,8 +47,10 @@ from train import (
     LATENT_INIT_FIRST_FRAME_REPEAT,
     compute_clean_latent_epsilon_target,
     generate_timestep_weights,
+    normalize_image_first_noise_mode,
     normalize_latent_init_mode,
     repeat_first_frame_latents,
+    sample_image_first_noise,
     sample_video_timesteps,
 )
 
@@ -67,9 +74,12 @@ def main() -> int:
         test_add_to_text_frame_token_conditioning_shapes,
         test_concat_frame_token_conditioning_shapes,
         test_sdxl_time_ids_shape_and_values,
+        test_train_configs_share_same_schema,
         test_sample_video_timesteps_shared_per_video,
         test_timestep_bias_weights_preserve_shared_video_timesteps,
         test_image_first_latent_repeat_and_target,
+        test_image_first_shared_noise_sampler,
+        test_image_first_switch_noise_level_from_sigmas,
         test_infer_name_step_path_resolution,
         test_guidance_scale_label_and_caption_file,
         test_infer_guidance_scale_resolution,
@@ -199,6 +209,28 @@ def test_sdxl_time_ids_shape_and_values() -> None:
     assert torch.equal(time_ids[0], torch.tensor([1024, 1024, 0, 0, 1024, 1024], dtype=torch.float32))
 
 
+def _schema_keys(value, prefix: tuple[str, ...] = ()) -> set[tuple[str, ...]]:
+    if not isinstance(value, dict):
+        return {prefix}
+    keys: set[tuple[str, ...]] = {prefix} if prefix else set()
+    for key, child in value.items():
+        keys.update(_schema_keys(child, (*prefix, str(key))))
+    return keys
+
+
+def test_train_configs_share_same_schema() -> None:
+    paths = sorted(Path("configs/train").glob("*.yaml"))
+    assert paths
+    schemas = {path: _schema_keys(load_config(path)) for path in paths}
+    reference_path = paths[0]
+    reference_schema = schemas[reference_path]
+    for path, schema in schemas.items():
+        assert schema == reference_schema, (
+            f"{path} schema mismatch against {reference_path}: "
+            f"missing={sorted(reference_schema - schema)}, extra={sorted(schema - reference_schema)}"
+        )
+
+
 def test_sample_video_timesteps_shared_per_video() -> None:
     timesteps = sample_video_timesteps(
         batch_size=4,
@@ -265,6 +297,62 @@ def test_image_first_latent_repeat_and_target() -> None:
         timesteps=timesteps,
     )
     assert torch.allclose(recovered, target)
+
+
+def test_image_first_shared_noise_sampler() -> None:
+    reference = torch.zeros(2 * 3, 1, 2, 2)
+    noise, shared_fraction = sample_image_first_noise(
+        reference=reference,
+        batch_size=2,
+        num_frames=3,
+        noise_mode="shared",
+        shared_noise_prob=1.0,
+        noise_offset=0.0,
+    )
+    grouped = noise.reshape(2, 3, 1, 2, 2)
+    assert shared_fraction == 1.0
+    assert torch.equal(grouped[:, 0], grouped[:, 1])
+    assert torch.equal(grouped[:, 0], grouped[:, 2])
+
+    mixed_noise, mixed_fraction = sample_image_first_noise(
+        reference=reference,
+        batch_size=2,
+        num_frames=3,
+        noise_mode="mixed",
+        shared_noise_prob=1.0,
+        noise_offset=0.0,
+    )
+    mixed_grouped = mixed_noise.reshape(2, 3, 1, 2, 2)
+    assert mixed_fraction == 1.0
+    assert torch.equal(mixed_grouped[:, 0], mixed_grouped[:, 1])
+    assert normalize_image_first_noise_mode("same_noise") == "shared"
+
+
+def test_image_first_switch_noise_level_from_sigmas() -> None:
+    class DummyScheduler:
+        sigmas = torch.tensor([3.0, 2.0, 1.0, 0.0])
+
+    timesteps = torch.tensor([999, 500, 0])
+    assert torch.equal(
+        _scheduler_switch_noise_level(
+            DummyScheduler(),
+            timesteps=timesteps,
+            step_index=1,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        ),
+        torch.tensor(2.0),
+    )
+    assert torch.equal(
+        _scheduler_switch_noise_level(
+            DummyScheduler(),
+            timesteps=timesteps,
+            step_index=3,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        ),
+        torch.tensor(0.0),
+    )
 
 
 def test_infer_name_step_path_resolution(tmp_path: Path | None = None) -> None:

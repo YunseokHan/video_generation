@@ -90,6 +90,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_inference_steps", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
+        "--switch_noise_scale",
+        type=float,
+        default=None,
+        help="Frame-wise perturbation scale applied after duplicating the image latent.",
+    )
+    parser.add_argument(
         "--save_mp4",
         action="store_true",
         help="Also write video.mp4 when MP4 export support is available.",
@@ -318,6 +324,11 @@ def main() -> None:
         else int(validation_config.get("num_inference_steps", 30))
     )
     fps = args.fps if args.fps is not None else int(validation_config.get("fps", 8))
+    switch_noise_scale = (
+        args.switch_noise_scale
+        if args.switch_noise_scale is not None
+        else float(validation_config.get("switch_noise_scale", 0.1))
+    )
     save_video = (args.save_mp4 or (args.name is not None and args.step is not None)) and not args.no_mp4
 
     frame_paths = generate_image_first_video_frames(
@@ -339,10 +350,14 @@ def main() -> None:
         save_grid=not args.no_grid,
         save_video=save_video,
         fps=int(fps),
+        switch_noise_scale=float(switch_noise_scale),
     )
     print(f"Loaded checkpoint from {checkpoint_dir}")
     print(f"Saved image-first outputs to {output_dir}")
-    print(f"Saved {len(frame_paths)} frames with t1={float(args.t1_ratio):g}, CFG={float(args.guidance_scale):g}")
+    print(
+        f"Saved {len(frame_paths)} frames with t1={float(args.t1_ratio):g}, "
+        f"CFG={float(args.guidance_scale):g}, switch_noise_scale={float(switch_noise_scale):g}"
+    )
 
 
 if __name__ == "__main__":
