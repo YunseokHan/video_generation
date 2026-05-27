@@ -5,7 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-DEFAULT_PYTHON_BIN="/NHNHOME/WORKSPACE/26moe001_D/miniconda3/envs/video/bin/python"
+DEFAULT_PYTHON_BIN="/home/work/data/miniconda3/envs/video/bin/python"
 PYTHON_BIN="${PYTHON_BIN:-${DEFAULT_PYTHON_BIN}}"
 ACCELERATE_BIN="${ACCELERATE_BIN:-$(dirname "${PYTHON_BIN}")/accelerate}"
 

@@ -30,10 +30,13 @@ data:
   ffmpeg_path: "ffmpeg"
   ffmpeg_threads: 1
   strict_decode: false
+  frame_storage_dtype: "uint8"
   num_workers: 4
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 2
+  dataloader_timeout: 120
+  torch_multiprocessing_sharing_strategy: "file_system"
 
 temporal_conditioning:
   type: "mlp"
@@ -43,6 +46,33 @@ temporal_conditioning:
   hidden_dim: 1024
   num_layers: 2
   alpha: 1.0
+
+latent_calibrator:
+  enabled: false
+  train: true
+  apply_mode: "switch_only"
+  architecture: "temporal_conv"
+  latent_channels: 4
+  hidden_channels: 64
+  num_blocks: 2
+  zero_init_output: true
+  timestep_embedding_dim: 256
+  prompt_embedding_dim: 1280
+  conditioning:
+    use_timestep: true
+    use_frame_pos: true
+    use_pooled_prompt: true
+    use_anchor_latent: true
+    input_mode: "concat_anchor_delta"
+  residual:
+    scale_mode: "clipped_snr"
+    max_scale: 0.5
+    norm_cap: 1.0
+  auxiliary_loss:
+    map_weight: 0.0
+    map_lowfreq_only: true
+    map_downsample_factor: 4
+    norm_weight: 0.0
 
 video_adapters:
   frame_position_encoder:
@@ -108,6 +138,12 @@ training:
   latent_init_mode: "first_frame_repeat"
   image_first_noise_mode: "mixed"
   image_first_shared_noise_prob: 0.5
+  image_first_bridge_mode: "always"
+  image_first_bridge_snr_min: null
+  image_first_bridge_snr_max: null
+  image_first_rollout_steps: 0
+  image_first_rollout_noise_offset: 0.0
+  image_first_rollout_switch_noise_scale: 0.0
   noise_offset: 0.0
   snr_gamma: null
   timestep_bias_strategy: "none"

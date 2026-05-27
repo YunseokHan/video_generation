@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from .config import save_config
+from .latent_calibrator import build_latent_calibrator
 from .temporal import FramePositionMLP, build_frame_position_encoder
 from .video_attention import (
     load_video_attention_adapter_state_dict,
@@ -22,6 +23,7 @@ VIDEO_RESNET_ADAPTER_FILENAME = "resnet_video_adapter.pt"
 VAE_DECODER_RESNET_ADAPTER_FILENAME = "vae_decoder_video_adapter.pt"
 VIDEO_ATTENTION_ADAPTER_FILENAME = "attention_video_adapter.pt"
 FRAME_POSITION_ENCODER_FILENAME = "frame_position_encoder.pt"
+LATENT_CALIBRATOR_FILENAME = "latent_calibrator.pt"
 
 
 def _is_main_process(accelerator) -> bool:
@@ -39,6 +41,7 @@ def save_checkpoint(
     vae,
     temporal_mlp: FramePositionMLP,
     frame_position_encoder: torch.nn.Module | None,
+    latent_calibrator: torch.nn.Module | None,
     config: dict[str, Any],
     temporal_config: dict[str, Any],
     accelerator=None,
@@ -57,6 +60,7 @@ def save_checkpoint(
         vae,
         temporal_mlp,
         frame_position_encoder,
+        latent_calibrator,
         config,
         temporal_config,
         accelerator,
@@ -73,6 +77,7 @@ def _write_checkpoint(
     vae,
     temporal_mlp: FramePositionMLP,
     frame_position_encoder: torch.nn.Module | None,
+    latent_calibrator: torch.nn.Module | None,
     config: dict[str, Any],
     temporal_config: dict[str, Any],
     accelerator=None,
@@ -131,6 +136,16 @@ def _write_checkpoint(
             },
             checkpoint_dir / FRAME_POSITION_ENCODER_FILENAME,
         )
+    if latent_calibrator is not None:
+        calibrator_model = _unwrap(latent_calibrator, accelerator)
+        torch.save(
+            {
+                "global_step": step,
+                "state_dict": calibrator_model.state_dict(),
+                "config": config.get("latent_calibrator", {}),
+            },
+            checkpoint_dir / LATENT_CALIBRATOR_FILENAME,
+        )
     save_config(config, checkpoint_dir / "config.yaml")
 
 
@@ -163,6 +178,23 @@ def load_frame_position_encoder_checkpoint(
     encoder = build_frame_position_encoder(encoder_config)
     encoder.load_state_dict(payload["state_dict"])
     return encoder, encoder_config
+
+
+def load_latent_calibrator_checkpoint(
+    checkpoint_dir: str | Path,
+    map_location: str | torch.device = "cpu",
+) -> tuple[torch.nn.Module, dict[str, Any]] | tuple[None, None]:
+    checkpoint_path = Path(checkpoint_dir) / LATENT_CALIBRATOR_FILENAME
+    if not checkpoint_path.exists():
+        return None, None
+    payload = torch.load(checkpoint_path, map_location=map_location)
+    calibrator_config = dict(payload["config"])
+    calibrator_config["enabled"] = True
+    calibrator = build_latent_calibrator(calibrator_config)
+    if calibrator is None:
+        raise RuntimeError("Latent calibrator checkpoint exists but config did not build a module.")
+    calibrator.load_state_dict(payload["state_dict"])
+    return calibrator, calibrator_config
 
 
 def load_video_resnet_adapter_checkpoint(

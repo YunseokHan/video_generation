@@ -6,6 +6,7 @@ torchvision
 Pillow
 PyYAML
 imageio
+matplotlib
 wandb
 python-dotenv
 imageio-ffmpeg

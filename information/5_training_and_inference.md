@@ -100,6 +100,20 @@ bash scripts/train_single_gpu.sh
 The training dataloader uses pinned host memory and non-blocking host-to-device
 copies when `data.pin_memory=true`. With `num_workers>0`, it also enables
 persistent workers and prefetching from config.
+Train configs keep decoded frame batches in `uint8` while they pass through
+DataLoader multiprocessing queues, then `train.py` converts them to the VAE
+dtype and normalizes to `[-1, 1]` on the training device. This keeps
+multiprocessing enabled while reducing CPU shared-memory payload.
+
+Large video batches are transferred from worker processes through PyTorch CPU
+shared memory. If a worker cannot allocate a shared-memory object, one rank can
+stop receiving batches while other ranks continue to NCCL collectives; the
+visible tail error is then often an allreduce timeout. Reduce
+`data.num_workers` and `data.prefetch_factor`, disable persistent workers, or
+set `data.torch_multiprocessing_sharing_strategy: "file_system"` for more
+conservative runs. The train configs now set the sharing strategy to
+`"file_system"` and use `data.dataloader_timeout: 120` so stalled workers fail
+with a DataLoader error instead of waiting for the NCCL watchdog.
 
 The VAE is loaded through `AutoencoderKL.from_pretrained(...)` instead of
 reusing the bf16 pipeline copy. By default `model.vae_dtype: "fp32"`, matching
@@ -161,9 +175,10 @@ Training-caption media remains available through
 
 Default configs also set `training.train_unet=false`. The base SDXL UNet is
 frozen; only the added UNet Resnet adapters, UNet attention adapters, temporal
-pooled MLP, and enabled frame-token encoder parameters are optimized. The VAE
-decoder adapter remains active for decode/inference compatibility but is not
-trained by the current denoising-only objective.
+pooled MLP, enabled frame-token encoder parameters, and enabled latent
+calibrator parameters are optimized. The VAE decoder adapter remains active for
+decode/inference compatibility but is not trained by the current denoising-only
+objective.
 
 Image-first configs are available at:
 
@@ -171,6 +186,10 @@ Image-first configs are available at:
 configs/train/image_first_mixed.yaml
 configs/train/image_first_sinusoidal.yaml
 configs/train/image_first_learnable_frame_tokens.yaml
+configs/train/image_first_snr.yaml
+configs/train/image_first_snr_ea.yaml
+configs/train/image_first_rollout.yaml
+configs/train/image_first_rollout_snr.yaml
 ```
 
 Launch them with:
@@ -179,6 +198,10 @@ Launch them with:
 bash scripts/train_image_first.sh
 bash scripts/train_image_first_sinusoidal.sh
 bash scripts/train_image_first_learnable.sh
+bash scripts/train_image_first_snr.sh
+bash scripts/train_image_first_snr_ea.sh
+bash scripts/train_image_first_rollout.sh
+bash scripts/train_image_first_rollout_snr.sh
 ```
 
 These configs validate with CFG 8 only and run `t1` ratios
@@ -192,6 +215,31 @@ per video, 50% frame-shared noise and 50% frame-independent noise.
 `configs/train/image_first_sinusoidal.yaml`. It keeps the original
 frame-independent training noise while using the same image-first validation
 path and default `validation.switch_noise_scale: 0.1`.
+
+`scripts/train_image_first_snr.sh` launches
+`configs/train/image_first_snr.yaml`. It sets
+`training.image_first_bridge_mode: "snr"` and
+`training.image_first_bridge_snr_max: 5.0`, so timesteps above that SNR use
+standard video DDPM noising/epsilon targets instead of the anchor bridge.
+
+`scripts/train_image_first_snr_ea.sh` launches
+`configs/train/image_first_snr_ea.yaml`. It keeps the same SNR-gated bridge and
+enables `latent_calibrator`, a zero-init temporal-conv residual mapper applied
+to bridged anchor latents before the UNet/video adapters. It also uses a weak
+low-frequency latent alignment auxiliary loss.
+
+`scripts/train_image_first_rollout.sh` launches
+`configs/train/image_first_rollout.yaml`. It sets
+`training.image_first_bridge_mode: "rollout"`, creates a source image latent
+by running a small base-SDXL denoising rollout with video adapters inactive,
+then duplicates that source latent across frames.
+
+`scripts/train_image_first_rollout_snr.sh` launches
+`configs/train/image_first_rollout_snr.yaml`. It sets
+`training.image_first_bridge_mode: "rollout_snr"` and
+`training.image_first_bridge_snr_max: 5.0`, so bridged timesteps use the
+rollout source while higher-SNR timesteps fall back to standard video DDPM
+noising/epsilon targets.
 
 `global_step` is an optimizer-step counter, not a dataloader microbatch counter.
 With `train_batch_size: 1`, `gradient_accumulation_steps: 4`,

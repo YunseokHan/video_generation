@@ -147,6 +147,39 @@ frames. `mixed` chooses shared noise for each video with
 `image_first_shared_noise_prob` and otherwise uses frame-independent noise.
 `configs/train/image_first_mixed.yaml` sets `mixed` with probability `0.5`.
 
+`training.image_first_bridge_mode` controls which source distribution is used
+for `first_frame_repeat`:
+
+```yaml
+training:
+  image_first_bridge_mode: "always"  # always | snr | rollout | rollout_snr
+  image_first_bridge_snr_min: null
+  image_first_bridge_snr_max: null
+  image_first_rollout_steps: 0
+  image_first_rollout_noise_offset: 0.0
+  image_first_rollout_switch_noise_scale: 0.0
+```
+
+`always` is the original behavior above. `snr` computes SNR from the sampled
+timestep and applies the anchor bridge only inside the configured SNR range.
+Frames outside that range use standard video noising from `clean_latents`.
+`configs/train/image_first_snr.yaml` sets `image_first_bridge_snr_max: 5.0`,
+so high-SNR/near-clean timesteps avoid the large anchor-to-video correction.
+`configs/train/image_first_snr_ea.yaml` keeps this SNR gate and enables
+`latent_calibrator`, which is applied only to the bridged frames before the
+UNet/video adapters.
+
+`rollout` does not call `add_noise(...)` on the duplicated frame sequence.
+Instead, the first-frame anchor is noised at a slightly earlier timestep,
+denoised for `image_first_rollout_steps` base-SDXL steps with video adapters
+inactive, duplicated across frames, and optionally perturbed with frame-wise
+`image_first_rollout_switch_noise_scale` noise.
+
+`rollout_snr` uses the same rollout source for frames inside the configured SNR
+range and uses standard video noising/epsilon targets for frames outside that
+range. `configs/train/image_first_rollout_snr.yaml` sets
+`image_first_bridge_snr_max: 5.0`.
+
 ## Prediction Target
 
 The UNet receives:
@@ -179,6 +212,31 @@ This keeps the UNet interface in epsilon-prediction form while changing the
 implied clean-latent target from the repeated first frame to the full video.
 This mode currently requires `prediction_type: epsilon`; `train.py` raises for
 other prediction types.
+
+When `image_first_bridge_mode: "snr"` or `"rollout_snr"`, the formula above is
+used only for frames whose sampled timestep falls inside the configured SNR
+bridge range. Other frames use the standard DDPM epsilon target. When
+`image_first_bridge_mode: "rollout"`, the same epsilon-to-clean conversion is
+applied to rollout-produced source latents rather than analytic
+anchor-forward-noised latents.
+
+If `latent_calibrator.enabled=true`, `train.py` computes:
+
+```text
+z_t,calib = M_phi(z_t,anchor, E(a), t, f, c)
+```
+
+for frames selected by the image-first bridge mask. The calibrator is a
+zero-init residual mapper, so the initial model input is identical to the
+uncalibrated image-first input. The same bridge noise is used to construct the
+auxiliary map target:
+
+```text
+z_t,video = sqrt(alpha_bar_t) * z* + sqrt(1 - alpha_bar_t) * epsilon_bridge
+```
+
+This keeps the auxiliary target focused on the deterministic anchor-to-video
+latent mismatch rather than an unrelated stochastic noise mismatch.
 
 The code also supports `prediction_type: v_prediction` if a future scheduler
 config uses it:
@@ -228,6 +286,20 @@ min(snr, gamma) / (snr + 1)
 ```
 
 The default is `null`, so the loss is unweighted MSE.
+
+When `latent_calibrator.enabled=true`, the total objective adds optional
+calibrator-only auxiliary terms:
+
+```text
+loss =
+  diffusion_mse
+  + map_weight  * ||Down(z_t,calib) - Down(sg(z_t,video))||^2
+  + norm_weight * max(0, rms(delta_phi) - norm_cap)^2
+```
+
+`configs/train/image_first_snr_ea.yaml` sets `map_weight: 0.05`,
+`map_lowfreq_only: true`, `map_downsample_factor: 4`, and
+`norm_weight: 0.001`.
 
 ## Optimization Step Accounting
 

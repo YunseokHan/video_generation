@@ -29,6 +29,7 @@ Use these sections as the first stop before editing code:
 - `information/8_resource_estimates.md`: parameter counts and VRAM estimates
 - `information/9_loss_and_timestep_schedule.md`: diffusion loss and timestep sampling
 - `information/10_image_first_training.md`: first-frame-repeat latent objective and image-first inference
+- `information/11_latent_calibrator.md`: zero-init anchor-to-video latent calibrator
 
 When adding a new module or ablation, either update the relevant file above or
 add a new numbered markdown file and link it here.
@@ -111,6 +112,30 @@ Image-first learnable frame-token ablation:
 bash scripts/train_image_first_learnable.sh
 ```
 
+Image-first SNR-gated hybrid training:
+
+```bash
+bash scripts/train_image_first_snr.sh
+```
+
+Image-first SNR-gated training with anchor-expansion calibrator:
+
+```bash
+bash scripts/train_image_first_snr_ea.sh
+```
+
+Image-first rollout-source training:
+
+```bash
+bash scripts/train_image_first_rollout.sh
+```
+
+Image-first rollout-source training with SNR-gated fallback:
+
+```bash
+bash scripts/train_image_first_rollout_snr.sh
+```
+
 `configs/train/default.yaml` enables:
 
 - UNet convolutional/Resnet video adapters
@@ -129,8 +154,12 @@ changes frame-wise token embedding to learned tokens with
 `token_embedding_mode: concat_tokens`.
 
 `configs/train/image_first_mixed.yaml`,
-`configs/train/image_first_sinusoidal.yaml`, and
-`configs/train/image_first_learnable_frame_tokens.yaml` set
+`configs/train/image_first_sinusoidal.yaml`,
+`configs/train/image_first_learnable_frame_tokens.yaml`,
+`configs/train/image_first_snr.yaml`,
+`configs/train/image_first_snr_ea.yaml`,
+`configs/train/image_first_rollout.yaml`, and
+`configs/train/image_first_rollout_snr.yaml` set
 `training.latent_init_mode: "first_frame_repeat"`. In this mode training
 corrupts repeated first-frame latents while the objective denoises to the full
 ground-truth video latent. Validation runs CFG 8 at `t1` ratios
@@ -140,6 +169,27 @@ ground-truth video latent. Validation runs CFG 8 at `t1` ratios
 config. It uses `training.image_first_noise_mode: "mixed"` with
 `image_first_shared_noise_prob: 0.5`, so half of the videos use frame-shared
 noise and half use frame-independent noise.
+
+`configs/train/image_first_snr.yaml` uses
+`training.image_first_bridge_mode: "snr"` and applies the anchor bridge only
+when SNR is at or below `image_first_bridge_snr_max`; high-SNR/near-clean
+timesteps fall back to standard video DDPM noising.
+
+`configs/train/image_first_snr_ea.yaml` keeps the SNR-gated bridge and enables
+the zero-init temporal-conv latent calibrator. The calibrator maps
+anchor-expanded noisy latents toward the true-video noised latent distribution
+before the UNet/video adapters, with a weak low-frequency alignment loss.
+
+`configs/train/image_first_rollout.yaml` uses
+`training.image_first_bridge_mode: "rollout"` and creates the source image
+latent by noising the anchor, denoising it for a small number of base-SDXL
+steps with video adapters inactive, then duplicating the resulting latent
+across frames.
+
+`configs/train/image_first_rollout_snr.yaml` uses
+`training.image_first_bridge_mode: "rollout_snr"`. Timesteps inside the SNR
+range use the rollout source above; timesteps outside the range fall back to
+standard video DDPM noising and sampled epsilon targets.
 
 `configs/accelerate/default.yaml` is the default multi-GPU launcher config and
 uses 4 GPU processes (`gpu_ids: "0,1,2,3"`).

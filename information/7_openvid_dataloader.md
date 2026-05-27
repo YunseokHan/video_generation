@@ -108,11 +108,27 @@ data:
   ffmpeg_path: "ffmpeg"
   ffmpeg_threads: 1
   strict_decode: false
+  frame_storage_dtype: "uint8"
   num_workers: 4
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 2
+  dataloader_timeout: 120
+  torch_multiprocessing_sharing_strategy: "file_system"
 ```
+
+`torch_multiprocessing_sharing_strategy` is passed to
+`torch.multiprocessing.set_sharing_strategy(...)` before DataLoader workers are
+created. The train configs use `"file_system"` to reduce file-descriptor based
+shared-memory pressure when CPU tensors are passed from workers to the main
+process. `dataloader_timeout: 120` makes stalled workers fail earlier instead
+of leaving distributed ranks to hit the NCCL watchdog timeout.
+
+`frame_storage_dtype: "uint8"` keeps decoded frames as byte tensors while they
+move through DataLoader worker queues. `train.py` converts them to the VAE
+dtype and normalizes to `[-1, 1]` after moving the batch to the training
+device. This preserves multiprocessing throughput while reducing the shared
+CPU tensor payload by 4x compared with float32 frames.
 
 Useful filters:
 

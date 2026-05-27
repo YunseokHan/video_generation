@@ -20,6 +20,8 @@ except ImportError:  # pragma: no cover - torch environments generally include n
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".mkv", ".avi"}
 DEFAULT_OPENVID_ROOT = "/NHNHOME/WORKSPACE/26moe001_D/dataset/OpenVid-1M/OpenVid_extracted"
+FRAME_STORAGE_FLOAT32 = "float32"
+FRAME_STORAGE_UINT8 = "uint8"
 PIL_INTERPOLATION = {
     "nearest": Image.Resampling.NEAREST,
     "bilinear": Image.Resampling.BILINEAR,
@@ -32,6 +34,29 @@ FFMPEG_SCALE_FLAGS = {
     "bicubic": "bicubic",
     "lanczos": "lanczos",
 }
+
+
+def normalize_frame_storage_dtype(dtype: str | None) -> str:
+    normalized = str(dtype or FRAME_STORAGE_FLOAT32).lower()
+    aliases = {
+        "float": FRAME_STORAGE_FLOAT32,
+        "float32": FRAME_STORAGE_FLOAT32,
+        "fp32": FRAME_STORAGE_FLOAT32,
+        "normalized": FRAME_STORAGE_FLOAT32,
+        "uint8": FRAME_STORAGE_UINT8,
+        "byte": FRAME_STORAGE_UINT8,
+        "bytes": FRAME_STORAGE_UINT8,
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "data.frame_storage_dtype must be one of float32 or uint8, "
+            f"got {dtype!r}."
+        )
+    return aliases[normalized]
+
+
+def _frames_uint8_to_float(frames: torch.Tensor) -> torch.Tensor:
+    return frames.float() / 127.5 - 1.0
 
 
 def make_frame_positions(num_frames: int, normalize: bool = True) -> torch.Tensor:
@@ -118,6 +143,7 @@ class PlaceholderVideoDataset(Dataset):
         center_crop: bool = False,
         random_flip: bool = False,
         image_interpolation_mode: str = "lanczos",
+        frame_storage_dtype: str = FRAME_STORAGE_FLOAT32,
         seed: int = 0,
     ) -> None:
         if frame_sampling != "uniform":
@@ -130,6 +156,7 @@ class PlaceholderVideoDataset(Dataset):
         self.normalize_positions = normalize_positions
         self.center_crop = bool(center_crop)
         self.random_flip = bool(random_flip)
+        self.frame_storage_dtype = normalize_frame_storage_dtype(frame_storage_dtype)
         self.interpolation = PIL_INTERPOLATION.get(
             str(image_interpolation_mode).lower(),
             Image.Resampling.LANCZOS,
@@ -153,15 +180,24 @@ class PlaceholderVideoDataset(Dataset):
             frames = self._load_image_frames(index)
         else:
             generator = torch.Generator().manual_seed(self.seed + int(index))
-            frames = torch.rand(
-                self.num_frames_per_video,
-                3,
-                self.resolution,
-                self.resolution,
-                generator=generator,
-                dtype=torch.float32,
-            )
-            frames = frames * 2.0 - 1.0
+            if self.frame_storage_dtype == FRAME_STORAGE_UINT8:
+                frames = torch.randint(
+                    0,
+                    256,
+                    (self.num_frames_per_video, 3, self.resolution, self.resolution),
+                    generator=generator,
+                    dtype=torch.uint8,
+                )
+            else:
+                frames = torch.rand(
+                    self.num_frames_per_video,
+                    3,
+                    self.resolution,
+                    self.resolution,
+                    generator=generator,
+                    dtype=torch.float32,
+                )
+                frames = frames * 2.0 - 1.0
 
         return {
             "frames": frames,
@@ -191,7 +227,9 @@ class PlaceholderVideoDataset(Dataset):
             if do_flip:
                 image = ImageOps.mirror(image)
             array = np.asarray(image).copy()
-            tensor = torch.from_numpy(array).permute(2, 0, 1).float() / 127.5 - 1.0
+            tensor = torch.from_numpy(array).permute(2, 0, 1)
+            if self.frame_storage_dtype == FRAME_STORAGE_FLOAT32:
+                tensor = _frames_uint8_to_float(tensor)
             frames.append(tensor)
         return torch.stack(frames, dim=0)
 
@@ -263,6 +301,7 @@ class OpenVidVideoDataset(Dataset):
         center_crop: bool = False,
         random_flip: bool = False,
         image_interpolation_mode: str = "lanczos",
+        frame_storage_dtype: str = FRAME_STORAGE_FLOAT32,
     ) -> None:
         if frame_sampling not in {"uniform", "random"}:
             raise ValueError(f"OpenVid frame_sampling must be 'uniform' or 'random', got {frame_sampling!r}.")
@@ -278,6 +317,7 @@ class OpenVidVideoDataset(Dataset):
         self.strict_decode = bool(strict_decode)
         self.center_crop = bool(center_crop)
         self.random_flip = bool(random_flip)
+        self.frame_storage_dtype = normalize_frame_storage_dtype(frame_storage_dtype)
         self.ffmpeg_scale_flags = FFMPEG_SCALE_FLAGS.get(
             str(image_interpolation_mode).lower(),
             "lanczos",
@@ -524,12 +564,20 @@ class OpenVidVideoDataset(Dataset):
             message = result.stderr.decode("utf-8", errors="replace").strip()
             if self.strict_decode:
                 raise RuntimeError(f"ffmpeg failed for {path}: {message}")
+            if self.frame_storage_dtype == FRAME_STORAGE_UINT8:
+                return torch.full(
+                    (self.num_frames_per_video, 3, self.resolution, self.resolution),
+                    127,
+                    dtype=torch.uint8,
+                )
             return torch.zeros(self.num_frames_per_video, 3, self.resolution, self.resolution)
 
         usable_bytes = decoded_count * frame_bytes
         array = torch.frombuffer(bytearray(result.stdout[:usable_bytes]), dtype=torch.uint8)
         frames = array.reshape(decoded_count, self.resolution, self.resolution, 3)
-        frames = frames.permute(0, 3, 1, 2).float() / 127.5 - 1.0
+        frames = frames.permute(0, 3, 1, 2).contiguous()
+        if self.frame_storage_dtype == FRAME_STORAGE_FLOAT32:
+            frames = _frames_uint8_to_float(frames)
         if decoded_count < len(unique_indices):
             pad = frames[-1:].expand(len(unique_indices) - decoded_count, -1, -1, -1)
             frames = torch.cat([frames, pad], dim=0)
@@ -560,6 +608,7 @@ def build_dataset(config: dict[str, Any]) -> Dataset:
             center_crop=data_config.get("center_crop", False),
             random_flip=data_config.get("random_flip", False),
             image_interpolation_mode=data_config.get("image_interpolation_mode", "lanczos"),
+            frame_storage_dtype=data_config.get("frame_storage_dtype", FRAME_STORAGE_FLOAT32),
             seed=config.get("training", {}).get("seed", 0),
         )
     if dataset_type == "openvid":
@@ -584,5 +633,6 @@ def build_dataset(config: dict[str, Any]) -> Dataset:
             center_crop=data_config.get("center_crop", False),
             random_flip=data_config.get("random_flip", False),
             image_interpolation_mode=data_config.get("image_interpolation_mode", "lanczos"),
+            frame_storage_dtype=data_config.get("frame_storage_dtype", FRAME_STORAGE_FLOAT32),
         )
     raise ValueError(f"Unsupported dataset_type {dataset_type!r}; expected 'placeholder' or 'openvid'.")

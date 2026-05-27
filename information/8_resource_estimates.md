@@ -122,10 +122,20 @@ Each decoded sample at the current default 512 shape is:
 
 ```text
 [8, 3, 512, 512] float32 ~= 24 MiB host memory
+[8, 3, 512, 512] uint8   ~=  6 MiB host memory
 ```
 
-With `num_workers: 4`, `prefetch_factor: 2`, and one sample per worker queue,
-each training process can hold roughly 192 MiB of prefetched decoded frame
-tensors, plus ffmpeg buffers. Across 4 GPU processes, budget several GiB of
-pinned host memory. This is intentional to reduce GPU starvation from video
-decode latency.
+With `train_batch_size: 4`, `num_workers: 4`, and `prefetch_factor: 2`, each
+rank can have up to eight decoded batches queued. With the current train config
+default `frame_storage_dtype: "uint8"`, the frame tensor part alone is roughly:
+
+```text
+6 MiB/sample * 4 samples/batch * 4 workers * 2 prefetched batches
+  ~= 192 MiB per rank
+```
+
+Across 4 GPU processes, budget several GiB of shared/pinned host memory, plus
+decoder and queue overhead. This improves GPU utilization but can exhaust
+shared-memory resources on long runs. If that happens, first try
+`torch_multiprocessing_sharing_strategy: "file_system"`; reducing workers or
+prefetch depth is the stronger but slower fallback.

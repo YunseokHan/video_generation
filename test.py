@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover - lets the video env run smoke tests wit
 
 from framegen.data import (
     DEFAULT_OPENVID_ROOT,
+    PlaceholderVideoDataset,
     OpenVidVideoDataset,
     flatten_video_batch,
     make_frame_positions,
@@ -28,6 +29,11 @@ from framegen.image_first_generation import (
     _scheduler_switch_noise_level,
     image_first_output_dir,
     t1_ratio_label,
+)
+from framegen.latent_calibrator import (
+    TemporalConvLatentCalibrator,
+    latent_calibrator_alignment_loss,
+    latent_calibrator_norm_loss,
 )
 from framegen.utils import save_mp4
 from framegen.sdxl import (
@@ -45,13 +51,18 @@ from framegen.video_resnet import VideoResnetBlock2D, set_video_resnet_context
 from infer import resolve_checkpoint_dir, resolve_config_path, resolve_guidance_scales, resolve_output_dir
 from train import (
     LATENT_INIT_FIRST_FRAME_REPEAT,
+    _expand_rollout_switch_level,
     compute_clean_latent_epsilon_target,
+    compute_image_first_bridge_mask,
     generate_timestep_weights,
+    normalize_image_first_bridge_mode,
     normalize_image_first_noise_mode,
     normalize_latent_init_mode,
     repeat_first_frame_latents,
+    rollout_image_first_anchor_latents,
     sample_image_first_noise,
     sample_video_timesteps,
+    move_video_frames_to_device,
 )
 
 
@@ -68,6 +79,7 @@ def main() -> int:
     smoke_tests = [
         test_frame_positions_single_and_uniform,
         test_flatten_video_batch_repeats_captions_and_positions,
+        test_uint8_frame_storage_moves_to_normalized_float,
         test_temporal_mlp_matches_pooled_shape,
         test_frame_position_token_encoder_shapes,
         test_sinusoidal_frame_position_encoder_shapes,
@@ -78,8 +90,11 @@ def main() -> int:
         test_sample_video_timesteps_shared_per_video,
         test_timestep_bias_weights_preserve_shared_video_timesteps,
         test_image_first_latent_repeat_and_target,
+        test_image_first_snr_bridge_mask,
+        test_image_first_rollout_source_shape,
         test_image_first_shared_noise_sampler,
         test_image_first_switch_noise_level_from_sigmas,
+        test_latent_calibrator_zero_init_and_aux_losses,
         test_infer_name_step_path_resolution,
         test_guidance_scale_label_and_caption_file,
         test_infer_guidance_scale_resolution,
@@ -122,6 +137,27 @@ def test_flatten_video_batch_repeats_captions_and_positions() -> None:
     assert batch["original_sizes"].shape == (2, 2)
     assert batch["crop_top_lefts"].shape == (2, 2)
     assert batch["target_sizes"].shape == (2, 2)
+
+
+def test_uint8_frame_storage_moves_to_normalized_float() -> None:
+    dataset = PlaceholderVideoDataset(
+        num_videos=1,
+        num_frames_per_video=2,
+        resolution=8,
+        frame_storage_dtype="uint8",
+    )
+    item = dataset[0]
+    assert item["frames"].dtype == torch.uint8
+    batch = video_collate_fn([item])
+    moved = move_video_frames_to_device(
+        batch["frames"],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert moved.dtype == torch.float32
+    assert moved.shape == (1, 2, 3, 8, 8)
+    assert -1.01 <= float(moved.min()) <= 1.01
+    assert -1.01 <= float(moved.max()) <= 1.01
 
 
 def test_temporal_mlp_matches_pooled_shape() -> None:
@@ -299,6 +335,85 @@ def test_image_first_latent_repeat_and_target() -> None:
     assert torch.allclose(recovered, target)
 
 
+def test_image_first_snr_bridge_mask() -> None:
+    class DummyScheduler:
+        alphas_cumprod = torch.tensor([0.9, 0.5, 0.1], dtype=torch.float32)
+
+    timesteps = torch.tensor([0, 1, 2], dtype=torch.long)
+    mask = compute_image_first_bridge_mask(
+        noise_scheduler=DummyScheduler(),
+        timesteps=timesteps,
+        bridge_mode="snr",
+        snr_min=None,
+        snr_max=1.0,
+    )
+    assert torch.equal(mask, torch.tensor([False, True, True]))
+    assert normalize_image_first_bridge_mode("snr_hybrid") == "snr"
+    assert normalize_image_first_bridge_mode("anchor_rollout") == "rollout"
+    assert normalize_image_first_bridge_mode("snr_rollout") == "rollout_snr"
+
+    rollout_mask = compute_image_first_bridge_mask(
+        noise_scheduler=DummyScheduler(),
+        timesteps=timesteps,
+        bridge_mode="rollout_snr",
+        snr_min=None,
+        snr_max=1.0,
+    )
+    assert torch.equal(rollout_mask, mask)
+
+
+def test_image_first_rollout_source_shape() -> None:
+    DDPMScheduler = _importorskip("diffusers").DDPMScheduler
+
+    class DummyOutput:
+        def __init__(self, sample: torch.Tensor) -> None:
+            self.sample = sample
+
+    class DummyUnet(torch.nn.Module):
+        def forward(
+            self,
+            sample: torch.Tensor,
+            timestep: torch.Tensor,
+            encoder_hidden_states: torch.Tensor | None = None,
+            added_cond_kwargs: dict | None = None,
+        ) -> DummyOutput:
+            return DummyOutput(torch.zeros_like(sample))
+
+    scheduler = DDPMScheduler(
+        num_train_timesteps=10,
+        beta_schedule="linear",
+        prediction_type="epsilon",
+    )
+    anchors = torch.randn(2, 4, 4, 4)
+    timesteps = torch.tensor([3, 8], dtype=torch.long)
+    prompt_embeds = torch.randn(2, 5, 8)
+    pooled_prompt_embeds = torch.randn(2, 8)
+    time_ids = torch.randn(2, 6)
+    rollout = rollout_image_first_anchor_latents(
+        unet=DummyUnet(),
+        noise_scheduler=scheduler,
+        anchor_latents=anchors,
+        target_timesteps=timesteps,
+        prompt_embeds=prompt_embeds,
+        pooled_prompt_embeds=pooled_prompt_embeds,
+        add_time_ids=time_ids,
+        rollout_steps=2,
+    )
+    assert rollout.shape == anchors.shape
+    assert rollout.dtype == anchors.dtype
+
+    reference = torch.zeros(6, 4, 8, 8)
+    switch_level = _expand_rollout_switch_level(
+        torch.tensor([0.25, 0.5]),
+        batch_size=2,
+        num_frames=3,
+        reference=reference,
+    )
+    assert switch_level.shape == (6, 1, 1, 1)
+    assert torch.equal(switch_level[:3], torch.full((3, 1, 1, 1), 0.25))
+    assert torch.equal(switch_level[3:], torch.full((3, 1, 1, 1), 0.5))
+
+
 def test_image_first_shared_noise_sampler() -> None:
     reference = torch.zeros(2 * 3, 1, 2, 2)
     noise, shared_fraction = sample_image_first_noise(
@@ -353,6 +468,60 @@ def test_image_first_switch_noise_level_from_sigmas() -> None:
         ),
         torch.tensor(0.0),
     )
+
+
+def test_latent_calibrator_zero_init_and_aux_losses() -> None:
+    class DummyScheduler:
+        alphas_cumprod = torch.linspace(0.95, 0.05, steps=10)
+
+    torch.manual_seed(0)
+    calibrator = TemporalConvLatentCalibrator(
+        {
+            "enabled": True,
+            "hidden_channels": 8,
+            "num_blocks": 1,
+            "timestep_embedding_dim": 8,
+            "prompt_embedding_dim": 16,
+            "residual": {
+                "scale_mode": "clipped_snr",
+                "max_scale": 0.5,
+                "norm_cap": 1.0,
+            },
+        }
+    )
+    noisy = torch.randn(6, 4, 8, 8)
+    anchor = torch.randn_like(noisy)
+    timesteps = torch.tensor([1, 1, 1, 5, 5, 5], dtype=torch.long)
+    frame_positions = make_frame_positions(3).repeat(2)
+    pooled_prompt_embeds = torch.randn(6, 16)
+
+    out, delta, scale = calibrator(
+        noisy_latents=noisy,
+        anchor_latents=anchor,
+        timesteps=timesteps,
+        frame_positions=frame_positions,
+        pooled_prompt_embeds=pooled_prompt_embeds,
+        num_frames=3,
+        noise_scheduler=DummyScheduler(),
+    )
+
+    assert out.shape == noisy.shape
+    assert delta.shape == noisy.shape
+    assert scale.shape == (6, 1, 1, 1)
+    assert torch.allclose(out, noisy, atol=1e-6)
+    assert torch.allclose(delta, torch.zeros_like(delta), atol=1e-6)
+
+    mask = torch.tensor([True, False, True, True, False, True])
+    assert torch.equal(
+        latent_calibrator_alignment_loss(out, out, mask),
+        torch.tensor(0.0),
+    )
+    norm_delta = torch.zeros_like(delta, requires_grad=True)
+    norm_loss = latent_calibrator_norm_loss(norm_delta, mask, norm_cap=1.0)
+    assert torch.equal(norm_loss, torch.tensor(0.0))
+    norm_loss.backward()
+    assert norm_delta.grad is not None
+    assert torch.isfinite(norm_delta.grad).all()
 
 
 def test_infer_name_step_path_resolution(tmp_path: Path | None = None) -> None:

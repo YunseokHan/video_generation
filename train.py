@@ -42,6 +42,12 @@ from framegen.image_first_generation import (
     generate_image_first_video_frames,
     t1_ratio_label,
 )
+from framegen.latent_calibrator import (
+    LatentCalibratorConfig,
+    build_latent_calibrator,
+    latent_calibrator_alignment_loss,
+    latent_calibrator_norm_loss,
+)
 from framegen.sdxl import (
     add_temporal_embedding_to_pooled_prompt_embeds,
     compute_sdxl_time_ids,
@@ -59,6 +65,7 @@ from framegen.video_attention import (
     VideoAttentionAdapterConfig,
     clear_video_attention_context,
     inject_video_attention_adapters,
+    iter_video_attention_blocks,
     set_video_attention_adapter_requires_grad,
     set_video_attention_adapters_active,
     set_video_attention_context,
@@ -68,6 +75,7 @@ from framegen.video_resnet import (
     VideoResnetAdapterConfig,
     clear_video_resnet_context,
     inject_video_resnet_adapters,
+    iter_video_resnet_blocks,
     set_video_resnet_adapter_requires_grad,
     set_video_resnet_adapters_active,
     set_video_resnet_context,
@@ -80,6 +88,10 @@ LATENT_INIT_FIRST_FRAME_REPEAT = "first_frame_repeat"
 IMAGE_FIRST_NOISE_INDEPENDENT = "independent"
 IMAGE_FIRST_NOISE_SHARED = "shared"
 IMAGE_FIRST_NOISE_MIXED = "mixed"
+IMAGE_FIRST_BRIDGE_ALWAYS = "always"
+IMAGE_FIRST_BRIDGE_SNR = "snr"
+IMAGE_FIRST_BRIDGE_ROLLOUT = "rollout"
+IMAGE_FIRST_BRIDGE_ROLLOUT_SNR = "rollout_snr"
 
 
 def parse_args() -> argparse.Namespace:
@@ -128,6 +140,34 @@ def normalize_image_first_noise_mode(mode: str | None) -> str:
     if normalized not in aliases:
         raise ValueError(
             "training.image_first_noise_mode must be one of independent, shared, or mixed, "
+            f"got {mode!r}."
+        )
+    return aliases[normalized]
+
+
+def normalize_image_first_bridge_mode(mode: str | None) -> str:
+    normalized = str(mode or IMAGE_FIRST_BRIDGE_ALWAYS).lower().replace("-", "_")
+    aliases = {
+        "": IMAGE_FIRST_BRIDGE_ALWAYS,
+        "default": IMAGE_FIRST_BRIDGE_ALWAYS,
+        "always": IMAGE_FIRST_BRIDGE_ALWAYS,
+        "anchor": IMAGE_FIRST_BRIDGE_ALWAYS,
+        "anchor_repeat": IMAGE_FIRST_BRIDGE_ALWAYS,
+        "first_frame_repeat": IMAGE_FIRST_BRIDGE_ALWAYS,
+        "snr": IMAGE_FIRST_BRIDGE_SNR,
+        "snr_hybrid": IMAGE_FIRST_BRIDGE_SNR,
+        "snr_gated": IMAGE_FIRST_BRIDGE_SNR,
+        "rollout": IMAGE_FIRST_BRIDGE_ROLLOUT,
+        "image_rollout": IMAGE_FIRST_BRIDGE_ROLLOUT,
+        "anchor_rollout": IMAGE_FIRST_BRIDGE_ROLLOUT,
+        "rollout_snr": IMAGE_FIRST_BRIDGE_ROLLOUT_SNR,
+        "snr_rollout": IMAGE_FIRST_BRIDGE_ROLLOUT_SNR,
+        "rollout_snr_hybrid": IMAGE_FIRST_BRIDGE_ROLLOUT_SNR,
+        "rollout_snr_gated": IMAGE_FIRST_BRIDGE_ROLLOUT_SNR,
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "training.image_first_bridge_mode must be one of always, snr, rollout, or rollout_snr, "
             f"got {mode!r}."
         )
     return aliases[normalized]
@@ -383,6 +423,160 @@ def sample_image_first_noise(
     return noise.reshape_as(reference), mask.float().mean().item()
 
 
+def _optional_float(value) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+        return None
+    return float(value)
+
+
+def compute_image_first_bridge_mask(
+    noise_scheduler: DDPMScheduler,
+    timesteps: torch.Tensor,
+    bridge_mode: str,
+    snr_min: float | None,
+    snr_max: float | None,
+) -> torch.Tensor:
+    mode = normalize_image_first_bridge_mode(bridge_mode)
+    if mode not in {IMAGE_FIRST_BRIDGE_SNR, IMAGE_FIRST_BRIDGE_ROLLOUT_SNR}:
+        return torch.ones_like(timesteps, dtype=torch.bool)
+
+    snr = compute_snr(noise_scheduler, timesteps)
+    mask = torch.ones_like(timesteps, dtype=torch.bool)
+    if snr_min is not None:
+        mask = mask & (snr >= float(snr_min))
+    if snr_max is not None:
+        mask = mask & (snr <= float(snr_max))
+    return mask
+
+
+def _expand_latent_mask(mask: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    expanded = mask.to(device=reference.device, dtype=torch.bool)
+    while expanded.ndim < reference.ndim:
+        expanded = expanded.unsqueeze(-1)
+    return expanded
+
+
+def _expand_rollout_switch_level(
+    switch_level: torch.Tensor,
+    batch_size: int,
+    num_frames: int,
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    """Repeat per-video switch noise levels over frames for latent broadcasting."""
+    expanded = switch_level.to(device=reference.device, dtype=reference.dtype).reshape(
+        int(batch_size),
+        *([1] * (reference.ndim - 1)),
+    )
+    expanded = expanded[:, None].expand(
+        int(batch_size),
+        int(num_frames),
+        *expanded.shape[1:],
+    )
+    return expanded.reshape(int(batch_size) * int(num_frames), *expanded.shape[2:])
+
+
+def _snapshot_adapter_states(module) -> list[tuple[object, bool]]:
+    snapshots: list[tuple[object, bool]] = []
+    snapshots.extend((block, bool(block.active)) for block in iter_video_resnet_blocks(module))
+    snapshots.extend((block, bool(block.active)) for block in iter_video_attention_blocks(module))
+    return snapshots
+
+
+def _set_adapter_snapshot_active(snapshot: list[tuple[object, bool]], active: bool) -> None:
+    for block, _ in snapshot:
+        block.active = bool(active)
+
+
+def _restore_adapter_snapshot(snapshot: list[tuple[object, bool]]) -> None:
+    for block, active in snapshot:
+        block.active = bool(active)
+
+
+@torch.no_grad()
+def rollout_image_first_anchor_latents(
+    unet,
+    noise_scheduler: DDPMScheduler,
+    anchor_latents: torch.Tensor,
+    target_timesteps: torch.Tensor,
+    prompt_embeds: torch.Tensor,
+    pooled_prompt_embeds: torch.Tensor,
+    add_time_ids: torch.Tensor,
+    rollout_steps: int,
+    noise_offset: float = 0.0,
+) -> torch.Tensor:
+    """Create inference-like image latents by denoising anchors with adapters off.
+
+    Each sample starts from the clean anchor noised at `target_t + rollout_steps`
+    and runs the base SDXL UNet down to `target_t`. The returned tensor is still
+    a single image latent per video; callers duplicate it across frames.
+    """
+
+    if anchor_latents.ndim != 4:
+        raise ValueError(f"Expected anchor_latents [B, C, H, W], got {tuple(anchor_latents.shape)}.")
+    batch_size = anchor_latents.shape[0]
+    if target_timesteps.shape[0] != batch_size:
+        raise ValueError("target_timesteps must contain one timestep per anchor latent.")
+    if int(rollout_steps) < 0:
+        raise ValueError("training.image_first_rollout_steps must be non-negative.")
+
+    steps = int(rollout_steps)
+    max_timestep = int(noise_scheduler.config.num_train_timesteps) - 1
+    adapter_snapshot = _snapshot_adapter_states(unet)
+    training_states = _set_eval_temporarily(unet)
+    outputs: list[torch.Tensor] = []
+
+    try:
+        _set_adapter_snapshot_active(adapter_snapshot, active=False)
+        for index in range(batch_size):
+            target_t = int(target_timesteps[index].item())
+            start_t = min(max_timestep, target_t + steps)
+            timestep_tensor = torch.tensor(
+                [start_t],
+                device=anchor_latents.device,
+                dtype=torch.long,
+            )
+            noise = torch.randn_like(anchor_latents[index : index + 1])
+            noise = add_noise_offset(noise, float(noise_offset))
+            latent = noise_scheduler.add_noise(
+                anchor_latents[index : index + 1],
+                noise,
+                timestep_tensor,
+            )
+
+            current_t = start_t
+            while current_t > target_t:
+                step_timestep = torch.tensor(
+                    current_t,
+                    device=anchor_latents.device,
+                    dtype=torch.long,
+                )
+                latent_model_input = noise_scheduler.scale_model_input(latent, step_timestep)
+                model_pred = unet(
+                    latent_model_input,
+                    step_timestep,
+                    encoder_hidden_states=prompt_embeds[index : index + 1],
+                    added_cond_kwargs={
+                        "text_embeds": pooled_prompt_embeds[index : index + 1],
+                        "time_ids": add_time_ids[index : index + 1],
+                    },
+                ).sample
+                latent = noise_scheduler.step(
+                    model_pred,
+                    current_t,
+                    latent,
+                    return_dict=False,
+                )[0]
+                current_t -= 1
+            outputs.append(latent[0])
+    finally:
+        _restore_adapter_snapshot(adapter_snapshot)
+        _restore_training_states(training_states)
+
+    return torch.stack(outputs, dim=0)
+
+
 def compute_clean_latent_epsilon_target(
     noisy_latents: torch.Tensor,
     clean_latents: torch.Tensor,
@@ -460,6 +654,18 @@ def compute_batch_sdxl_time_ids(
     values = torch.cat([original_sizes, crop_top_lefts, target_sizes], dim=1)
     values = values.repeat_interleave(int(num_frames), dim=0)
     return values.to(device=device, dtype=dtype, non_blocking=True)
+
+
+def move_video_frames_to_device(
+    frames: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+    non_blocking: bool = False,
+) -> torch.Tensor:
+    if frames.dtype == torch.uint8:
+        frames = frames.to(device=device, dtype=dtype, non_blocking=non_blocking)
+        return frames.mul_(1.0 / 127.5).sub_(1.0)
+    return frames.to(device=device, dtype=dtype, non_blocking=non_blocking)
 
 
 def log_startup(
@@ -869,6 +1075,7 @@ def save_training_checkpoint(
     vae,
     temporal_mlp,
     frame_position_encoder,
+    latent_calibrator,
     config: dict,
     temporal_config: dict,
     progress_bar=None,
@@ -880,6 +1087,7 @@ def save_training_checkpoint(
         vae=vae,
         temporal_mlp=temporal_mlp,
         frame_position_encoder=frame_position_encoder,
+        latent_calibrator=latent_calibrator,
         config=config,
         temporal_config=temporal_config,
         accelerator=accelerator,
@@ -954,10 +1162,43 @@ def main() -> None:
     training_config.setdefault("latent_init_mode", LATENT_INIT_VIDEO_GT)
     training_config.setdefault("image_first_noise_mode", IMAGE_FIRST_NOISE_INDEPENDENT)
     training_config.setdefault("image_first_shared_noise_prob", 0.5)
+    training_config.setdefault("image_first_bridge_mode", IMAGE_FIRST_BRIDGE_ALWAYS)
+    training_config.setdefault("image_first_bridge_snr_min", None)
+    training_config.setdefault("image_first_bridge_snr_max", None)
+    training_config.setdefault("image_first_rollout_steps", 0)
+    training_config.setdefault("image_first_rollout_noise_offset", 0.0)
+    training_config.setdefault("image_first_rollout_switch_noise_scale", 0.0)
     training_config.setdefault("proportion_empty_prompts", 0.0)
     training_config.setdefault("logging_dir", "logs")
     temporal_config = dict(config["temporal_conditioning"])
     video_adapter_config = config.setdefault("video_adapters", {})
+    latent_calibrator_config = dict(config.setdefault("latent_calibrator", {}))
+    latent_calibrator_config.setdefault("enabled", False)
+    latent_calibrator_config.setdefault("train", True)
+    latent_calibrator_config.setdefault("apply_mode", "switch_only")
+    latent_calibrator_config.setdefault("architecture", "temporal_conv")
+    latent_calibrator_config.setdefault("latent_channels", 4)
+    latent_calibrator_config.setdefault("hidden_channels", 64)
+    latent_calibrator_config.setdefault("num_blocks", 2)
+    latent_calibrator_config.setdefault("zero_init_output", True)
+    latent_calibrator_config.setdefault("timestep_embedding_dim", 256)
+    latent_calibrator_config.setdefault("prompt_embedding_dim", 1280)
+    latent_calibrator_config.setdefault("conditioning", {})
+    latent_calibrator_config["conditioning"].setdefault("use_timestep", True)
+    latent_calibrator_config["conditioning"].setdefault("use_frame_pos", True)
+    latent_calibrator_config["conditioning"].setdefault("use_pooled_prompt", True)
+    latent_calibrator_config["conditioning"].setdefault("use_anchor_latent", True)
+    latent_calibrator_config["conditioning"].setdefault("input_mode", "concat_anchor_delta")
+    latent_calibrator_config.setdefault("residual", {})
+    latent_calibrator_config["residual"].setdefault("scale_mode", "clipped_snr")
+    latent_calibrator_config["residual"].setdefault("max_scale", 0.5)
+    latent_calibrator_config["residual"].setdefault("norm_cap", 1.0)
+    latent_calibrator_config.setdefault("auxiliary_loss", {})
+    latent_calibrator_config["auxiliary_loss"].setdefault("map_weight", 0.0)
+    latent_calibrator_config["auxiliary_loss"].setdefault("map_lowfreq_only", True)
+    latent_calibrator_config["auxiliary_loss"].setdefault("map_downsample_factor", 4)
+    latent_calibrator_config["auxiliary_loss"].setdefault("norm_weight", 0.0)
+    config["latent_calibrator"] = latent_calibrator_config
     frame_encoder_config = dict(video_adapter_config.get("frame_position_encoder", {}))
     frame_encoder_config.setdefault("enabled", False)
     frame_encoder_config.setdefault("type", "sinusoidal")
@@ -1045,9 +1286,37 @@ def main() -> None:
         training_config.get("image_first_noise_mode")
     )
     training_config["image_first_noise_mode"] = image_first_noise_mode
+    image_first_bridge_mode = normalize_image_first_bridge_mode(
+        training_config.get("image_first_bridge_mode")
+    )
+    training_config["image_first_bridge_mode"] = image_first_bridge_mode
+    image_first_uses_rollout_bridge = image_first_bridge_mode in {
+        IMAGE_FIRST_BRIDGE_ROLLOUT,
+        IMAGE_FIRST_BRIDGE_ROLLOUT_SNR,
+    }
+    image_first_uses_snr_gate = image_first_bridge_mode in {
+        IMAGE_FIRST_BRIDGE_SNR,
+        IMAGE_FIRST_BRIDGE_ROLLOUT_SNR,
+    }
     image_first_shared_noise_prob = float(training_config.get("image_first_shared_noise_prob", 0.5))
     if not 0.0 <= image_first_shared_noise_prob <= 1.0:
         raise ValueError("training.image_first_shared_noise_prob must be in [0, 1].")
+    image_first_bridge_snr_min = _optional_float(training_config.get("image_first_bridge_snr_min"))
+    image_first_bridge_snr_max = _optional_float(training_config.get("image_first_bridge_snr_max"))
+    if (
+        image_first_bridge_snr_min is not None
+        and image_first_bridge_snr_max is not None
+        and image_first_bridge_snr_min > image_first_bridge_snr_max
+    ):
+        raise ValueError("training.image_first_bridge_snr_min must be <= image_first_bridge_snr_max.")
+    image_first_rollout_steps = int(training_config.get("image_first_rollout_steps", 0))
+    if image_first_rollout_steps < 0:
+        raise ValueError("training.image_first_rollout_steps must be non-negative.")
+    image_first_rollout_switch_noise_scale = float(
+        training_config.get("image_first_rollout_switch_noise_scale", 0.0)
+    )
+    if image_first_rollout_switch_noise_scale < 0:
+        raise ValueError("training.image_first_rollout_switch_noise_scale must be non-negative.")
     if (
         latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT
         and getattr(noise_scheduler.config, "prediction_type", "epsilon") != "epsilon"
@@ -1066,6 +1335,9 @@ def main() -> None:
     train_video_attention_adapters = video_attention_config.enabled and video_attention_config.train
     train_frame_position_encoder = bool(
         frame_encoder_config["enabled"] and frame_encoder_config.get("train", True)
+    )
+    train_latent_calibrator = bool(
+        latent_calibrator_config["enabled"] and latent_calibrator_config.get("train", True)
     )
     train_text_encoder = bool(training_config.get("train_text_encoder", False))
     train_vae = bool(training_config.get("train_vae", False))
@@ -1127,6 +1399,14 @@ def main() -> None:
         )
     inferred_output_dim = int(pooled_for_dim.shape[-1])
     temporal_config["output_dim"] = temporal_config.get("output_dim") or inferred_output_dim
+    latent_calibrator_config["prompt_embedding_dim"] = (
+        latent_calibrator_config.get("prompt_embedding_dim") or inferred_output_dim
+    )
+    if int(latent_calibrator_config["prompt_embedding_dim"]) != inferred_output_dim:
+        raise ValueError(
+            "latent_calibrator.prompt_embedding_dim must match SDXL pooled prompt dim "
+            f"({latent_calibrator_config['prompt_embedding_dim']} vs {inferred_output_dim})."
+        )
     if int(temporal_config["output_dim"]) != inferred_output_dim:
         raise ValueError(
             "temporal_conditioning.output_dim must match SDXL pooled prompt dim "
@@ -1144,11 +1424,15 @@ def main() -> None:
         frame_position_encoder = build_frame_position_encoder(frame_encoder_config)
         if not any(True for _ in frame_position_encoder.parameters()):
             train_frame_position_encoder = False
+    latent_calibrator = build_latent_calibrator(latent_calibrator_config)
     set_requires_grad(temporal_mlp, train_temporal_embedding)
     set_requires_grad(frame_position_encoder, train_frame_position_encoder)
+    set_requires_grad(latent_calibrator, train_latent_calibrator)
     temporal_mlp.train(train_temporal_embedding)
     if frame_position_encoder is not None:
         frame_position_encoder.train(train_frame_position_encoder)
+    if latent_calibrator is not None:
+        latent_calibrator.train(train_latent_calibrator)
     if not train_temporal_embedding:
         temporal_mlp.to(device=device, dtype=torch_dtype)
     if frame_position_encoder is not None and not train_frame_position_encoder:
@@ -1156,9 +1440,19 @@ def main() -> None:
             frame_position_encoder.to(device=device, dtype=torch_dtype)
         else:
             frame_position_encoder.to(device=device)
+    if latent_calibrator is not None and not train_latent_calibrator:
+        latent_calibrator.to(device=device, dtype=torch_dtype)
 
     trainable_count, frozen_count = count_trainable_and_frozen(
-        [unet, vae, text_encoder, text_encoder_2, temporal_mlp, frame_position_encoder]
+        [
+            unet,
+            vae,
+            text_encoder,
+            text_encoder_2,
+            temporal_mlp,
+            frame_position_encoder,
+            latent_calibrator,
+        ]
     )
     log_startup(accelerator, config, torch_dtype, temporal_config, trainable_count, frozen_count)
     accelerator.print(
@@ -1186,6 +1480,25 @@ def main() -> None:
         f"token_mode={frame_encoder_config['token_embedding_mode']}, "
         f"alpha={frame_encoder_config['alpha']}"
     )
+    if latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT:
+        accelerator.print(
+            "  image-first bridge: "
+            f"mode={image_first_bridge_mode}, noise_mode={image_first_noise_mode}, "
+            f"snr_min={image_first_bridge_snr_min}, snr_max={image_first_bridge_snr_max}, "
+            f"rollout_steps={image_first_rollout_steps}, "
+            f"rollout_switch_noise_scale={image_first_rollout_switch_noise_scale}"
+        )
+    latent_calibrator_settings = LatentCalibratorConfig.from_config(latent_calibrator_config)
+    accelerator.print(
+        "  latent calibrator: "
+        f"enabled={latent_calibrator_settings.enabled}, train={train_latent_calibrator}, "
+        f"architecture={latent_calibrator_settings.architecture}, "
+        f"hidden={latent_calibrator_settings.hidden_channels}, "
+        f"blocks={latent_calibrator_settings.num_blocks}, "
+        f"scale={latent_calibrator_settings.residual_scale_mode}, "
+        f"map_weight={latent_calibrator_settings.map_weight}, "
+        f"norm_weight={latent_calibrator_settings.norm_weight}"
+    )
     init_experiment_trackers(
         accelerator=accelerator,
         config=config,
@@ -1205,6 +1518,13 @@ def main() -> None:
 
     dataset = build_dataset(config)
     data_config = config["data"]
+    torch_sharing_strategy = data_config.get("torch_multiprocessing_sharing_strategy")
+    if torch_sharing_strategy is None:
+        torch_sharing_strategy = os.environ.get("TORCH_MP_SHARING_STRATEGY")
+    if torch_sharing_strategy is not None:
+        torch_sharing_strategy = str(torch_sharing_strategy).strip()
+    if torch_sharing_strategy and torch_sharing_strategy.lower() not in {"none", "null", "default"}:
+        torch.multiprocessing.set_sharing_strategy(torch_sharing_strategy)
     dataloader_num_workers = int(data_config.get("num_workers", 0))
     dataloader_pin_memory = bool(data_config.get("pin_memory", torch.cuda.is_available()))
     dataloader_kwargs = {
@@ -1215,10 +1535,21 @@ def main() -> None:
         "drop_last": True,
         "pin_memory": dataloader_pin_memory,
     }
+    dataloader_timeout = float(data_config.get("dataloader_timeout", 0) or 0)
+    if dataloader_timeout > 0:
+        dataloader_kwargs["timeout"] = dataloader_timeout
     if dataloader_num_workers > 0:
         dataloader_kwargs["persistent_workers"] = bool(data_config.get("persistent_workers", True))
         dataloader_kwargs["prefetch_factor"] = int(data_config.get("prefetch_factor", 2))
     dataloader = DataLoader(dataset, **dataloader_kwargs)
+    accelerator.print(
+        "  dataloader: "
+        f"workers={dataloader_num_workers}, pin_memory={dataloader_pin_memory}, "
+        f"persistent_workers={dataloader_kwargs.get('persistent_workers', False)}, "
+        f"prefetch_factor={dataloader_kwargs.get('prefetch_factor', None)}, "
+        f"timeout={dataloader_kwargs.get('timeout', 0)}, "
+        f"torch_mp_sharing={torch.multiprocessing.get_sharing_strategy()}"
+    )
     gradient_accumulation_steps = int(training_config["gradient_accumulation_steps"])
     num_update_steps_per_epoch = max(1, math.ceil(len(dataloader) / gradient_accumulation_steps))
     overrode_max_train_steps = training_config.get("max_train_steps") is None
@@ -1236,7 +1567,7 @@ def main() -> None:
 
     parameters = [
         parameter
-        for module in [unet, vae, text_encoder, text_encoder_2, temporal_mlp]
+        for module in [unet, vae, text_encoder, text_encoder_2, temporal_mlp, latent_calibrator]
         + ([frame_position_encoder] if frame_position_encoder is not None else [])
         if module is not None
         for parameter in module.parameters()
@@ -1254,6 +1585,8 @@ def main() -> None:
         named_models.append(("temporal_mlp", temporal_mlp))
     if train_frame_position_encoder and frame_position_encoder is not None:
         named_models.append(("frame_position_encoder", frame_position_encoder))
+    if train_latent_calibrator and latent_calibrator is not None:
+        named_models.append(("latent_calibrator", latent_calibrator))
     if train_text_encoder:
         named_models.extend([("text_encoder", text_encoder), ("text_encoder_2", text_encoder_2)])
     if train_vae or train_vae_decoder_resnet_adapters:
@@ -1269,6 +1602,7 @@ def main() -> None:
     unet = prepared_models.get("unet", unet)
     temporal_mlp = prepared_models.get("temporal_mlp", temporal_mlp)
     frame_position_encoder = prepared_models.get("frame_position_encoder", frame_position_encoder)
+    latent_calibrator = prepared_models.get("latent_calibrator", latent_calibrator)
     text_encoder = prepared_models.get("text_encoder", text_encoder)
     text_encoder_2 = prepared_models.get("text_encoder_2", text_encoder_2)
     vae = prepared_models.get("vae", vae)
@@ -1344,7 +1678,8 @@ def main() -> None:
         while global_step < max_train_steps:
             for batch in dataloader:
                 with accelerator.accumulate(*accumulation_models):
-                    frames = batch["frames"].to(
+                    frames = move_video_frames_to_device(
+                        batch["frames"],
                         device=accelerator.device,
                         dtype=vae_dtype,
                         non_blocking=dataloader_pin_memory,
@@ -1363,25 +1698,6 @@ def main() -> None:
                         latents = latents * vae.config.scaling_factor
 
                     clean_latents = latents
-                    noising_latents = clean_latents
-                    if latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT:
-                        noising_latents = repeat_first_frame_latents(
-                            clean_latents,
-                            batch_size=batch_size,
-                            num_frames=num_frames,
-                        )
-                        noise, image_first_shared_noise_fraction = sample_image_first_noise(
-                            reference=noising_latents,
-                            batch_size=batch_size,
-                            num_frames=num_frames,
-                            noise_mode=image_first_noise_mode,
-                            shared_noise_prob=image_first_shared_noise_prob,
-                            noise_offset=float(training_config.get("noise_offset", 0.0)),
-                        )
-                    else:
-                        image_first_shared_noise_fraction = 0.0
-                        noise = torch.randn_like(noising_latents)
-                        noise = add_noise_offset(noise, float(training_config.get("noise_offset", 0.0)))
                     timesteps = sample_video_timesteps(
                         batch_size=batch_size,
                         num_frames=num_frames,
@@ -1389,7 +1705,7 @@ def main() -> None:
                         device=latents.device,
                         timestep_weights=timestep_weights,
                     )
-                    noisy_latents = noise_scheduler.add_noise(noising_latents, noise, timesteps).to(dtype=torch_dtype)
+                    video_timesteps = timesteps.reshape(batch_size, num_frames)[:, 0]
 
                     text_context = contextlib.nullcontext() if train_text_encoder else torch.no_grad()
                     with text_context:
@@ -1397,6 +1713,8 @@ def main() -> None:
                             batch["captions"],
                             float(training_config.get("proportion_empty_prompts", 0.0)),
                         )
+                        prompt_embeds_image = None
+                        pooled_prompt_embeds_image = None
                         captions_for_text = (
                             [caption for caption in captions for _ in range(num_frames)]
                             if train_text_encoder
@@ -1412,8 +1730,23 @@ def main() -> None:
                             dtype=torch_dtype,
                         )
                         if not train_text_encoder:
+                            prompt_embeds_image = prompt_embeds
+                            pooled_prompt_embeds_image = pooled_prompt_embeds
                             prompt_embeds = prompt_embeds.repeat_interleave(num_frames, dim=0)
                             pooled_prompt_embeds = pooled_prompt_embeds.repeat_interleave(num_frames, dim=0)
+                        elif (
+                            latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT
+                            and image_first_uses_rollout_bridge
+                        ):
+                            prompt_embeds_image, pooled_prompt_embeds_image = encode_prompts_with_sdxl_logic(
+                                captions,
+                                tokenizer=tokenizer,
+                                tokenizer_2=tokenizer_2,
+                                text_encoder=text_encoder,
+                                text_encoder_2=text_encoder_2,
+                                device=accelerator.device,
+                                dtype=torch_dtype,
+                            )
 
                     modified_pooled_prompt_embeds, frame_embeds = (
                         add_temporal_embedding_to_pooled_prompt_embeds(
@@ -1431,6 +1764,179 @@ def main() -> None:
                         device=accelerator.device,
                         dtype=pooled_prompt_embeds.dtype,
                     )
+
+                    noising_latents = clean_latents
+                    standard_noise = None
+                    image_first_shared_noise_fraction = 0.0
+                    image_first_bridge_fraction = 0.0
+                    bridge_mask = None
+                    latent_calibrator_anchor_latents = None
+                    latent_calibrator_alignment_target = None
+                    latent_calibrator_mask = None
+                    latent_calibrator_map_loss = clean_latents.new_zeros(())
+                    latent_calibrator_norm_loss_value = clean_latents.new_zeros(())
+                    if latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT:
+                        if image_first_uses_rollout_bridge:
+                            if prompt_embeds_image is None or pooled_prompt_embeds_image is None:
+                                raise RuntimeError("Rollout source requires image-level prompt embeddings.")
+                            anchor_latents = clean_latents.reshape(
+                                batch_size,
+                                num_frames,
+                                *clean_latents.shape[1:],
+                            )[:, 0]
+                            rollout_add_time_ids = compute_batch_sdxl_time_ids(
+                                batch=batch,
+                                num_frames=1,
+                                fallback_resolution=resolution,
+                                device=accelerator.device,
+                                dtype=pooled_prompt_embeds.dtype,
+                            )
+                            rollout_anchor_latents = rollout_image_first_anchor_latents(
+                                unet=unet,
+                                noise_scheduler=noise_scheduler,
+                                anchor_latents=anchor_latents.to(dtype=torch_dtype),
+                                target_timesteps=video_timesteps,
+                                prompt_embeds=prompt_embeds_image.detach(),
+                                pooled_prompt_embeds=pooled_prompt_embeds_image.detach(),
+                                add_time_ids=rollout_add_time_ids,
+                                rollout_steps=image_first_rollout_steps,
+                                noise_offset=float(
+                                    training_config.get("image_first_rollout_noise_offset", 0.0)
+                                ),
+                            )
+                            noisy_latents = rollout_anchor_latents[:, None].expand(
+                                -1,
+                                num_frames,
+                                -1,
+                                -1,
+                                -1,
+                            ).reshape_as(clean_latents)
+                            if image_first_rollout_switch_noise_scale > 0:
+                                switch_level = (1.0 / (1.0 + compute_snr(noise_scheduler, video_timesteps))).sqrt()
+                                while switch_level.ndim < rollout_anchor_latents.ndim:
+                                    switch_level = switch_level.unsqueeze(-1)
+                                switch_noise = torch.randn(
+                                    (batch_size, num_frames, *rollout_anchor_latents.shape[1:]),
+                                    device=rollout_anchor_latents.device,
+                                    dtype=rollout_anchor_latents.dtype,
+                                ).reshape_as(clean_latents)
+                                switch_level = _expand_rollout_switch_level(
+                                    switch_level=switch_level,
+                                    batch_size=batch_size,
+                                    num_frames=num_frames,
+                                    reference=clean_latents,
+                                )
+                                noisy_latents = noisy_latents + (
+                                    image_first_rollout_switch_noise_scale
+                                    * switch_level.to(device=noisy_latents.device, dtype=noisy_latents.dtype)
+                                    * switch_noise
+                                )
+                            noisy_latents = noisy_latents.to(dtype=torch_dtype)
+                            noising_latents = noisy_latents
+                            if image_first_bridge_mode == IMAGE_FIRST_BRIDGE_ROLLOUT_SNR:
+                                bridge_mask = compute_image_first_bridge_mask(
+                                    noise_scheduler=noise_scheduler,
+                                    timesteps=timesteps,
+                                    bridge_mode=image_first_bridge_mode,
+                                    snr_min=image_first_bridge_snr_min,
+                                    snr_max=image_first_bridge_snr_max,
+                                )
+                                image_first_bridge_fraction = bridge_mask.float().mean().item()
+                                standard_noise = torch.randn_like(clean_latents)
+                                standard_noise = add_noise_offset(
+                                    standard_noise,
+                                    float(training_config.get("noise_offset", 0.0)),
+                                )
+                                standard_noisy_latents = noise_scheduler.add_noise(
+                                    clean_latents,
+                                    standard_noise,
+                                    timesteps,
+                                ).to(dtype=torch_dtype)
+                                mask = _expand_latent_mask(bridge_mask, noisy_latents)
+                                noisy_latents = torch.where(mask, noisy_latents, standard_noisy_latents)
+                                noising_latents = noisy_latents
+                            else:
+                                image_first_bridge_fraction = 1.0
+                        else:
+                            anchor_noising_latents = repeat_first_frame_latents(
+                                clean_latents,
+                                batch_size=batch_size,
+                                num_frames=num_frames,
+                            )
+                            bridge_noise, image_first_shared_noise_fraction = sample_image_first_noise(
+                                reference=anchor_noising_latents,
+                                batch_size=batch_size,
+                                num_frames=num_frames,
+                                noise_mode=image_first_noise_mode,
+                                shared_noise_prob=image_first_shared_noise_prob,
+                                noise_offset=float(training_config.get("noise_offset", 0.0)),
+                            )
+                            bridge_mask = compute_image_first_bridge_mask(
+                                noise_scheduler=noise_scheduler,
+                                timesteps=timesteps,
+                                bridge_mode=image_first_bridge_mode,
+                                snr_min=image_first_bridge_snr_min,
+                                snr_max=image_first_bridge_snr_max,
+                            )
+                            image_first_bridge_fraction = bridge_mask.float().mean().item()
+                            mask = _expand_latent_mask(bridge_mask, clean_latents)
+                            if image_first_bridge_mode == IMAGE_FIRST_BRIDGE_SNR:
+                                standard_noise = torch.randn_like(clean_latents)
+                                standard_noise = add_noise_offset(
+                                    standard_noise,
+                                    float(training_config.get("noise_offset", 0.0)),
+                                )
+                                noising_latents = torch.where(mask, anchor_noising_latents, clean_latents)
+                                noise = torch.where(mask, bridge_noise, standard_noise)
+                            else:
+                                noising_latents = anchor_noising_latents
+                                noise = bridge_noise
+                            noisy_latents = noise_scheduler.add_noise(
+                                noising_latents,
+                                noise,
+                                timesteps,
+                            ).to(dtype=torch_dtype)
+                            latent_calibrator_anchor_latents = anchor_noising_latents.to(dtype=torch_dtype)
+                            latent_calibrator_alignment_target = noise_scheduler.add_noise(
+                                clean_latents,
+                                bridge_noise,
+                                timesteps,
+                            ).to(dtype=torch_dtype)
+                            latent_calibrator_mask = bridge_mask
+                    else:
+                        noise = torch.randn_like(noising_latents)
+                        noise = add_noise_offset(noise, float(training_config.get("noise_offset", 0.0)))
+                        noisy_latents = noise_scheduler.add_noise(noising_latents, noise, timesteps).to(dtype=torch_dtype)
+
+                    if (
+                        latent_calibrator is not None
+                        and latent_calibrator_anchor_latents is not None
+                        and latent_calibrator_mask is not None
+                    ):
+                        calibrated_latents, latent_calibrator_delta, _ = latent_calibrator(
+                            noisy_latents=noisy_latents,
+                            anchor_latents=latent_calibrator_anchor_latents,
+                            timesteps=timesteps,
+                            frame_positions=frame_positions_flat,
+                            pooled_prompt_embeds=modified_pooled_prompt_embeds,
+                            num_frames=num_frames,
+                            noise_scheduler=noise_scheduler,
+                        )
+                        calibrator_mask = _expand_latent_mask(latent_calibrator_mask, noisy_latents)
+                        noisy_latents = torch.where(calibrator_mask, calibrated_latents, noisy_latents)
+                        if latent_calibrator_alignment_target is not None:
+                            latent_calibrator_map_loss = latent_calibrator_alignment_loss(
+                                calibrated_latents=noisy_latents,
+                                target_latents=latent_calibrator_alignment_target,
+                                mask=latent_calibrator_mask,
+                                lowfreq_only=latent_calibrator_settings.map_lowfreq_only,
+                                downsample_factor=latent_calibrator_settings.map_downsample_factor,
+                            )
+                        latent_calibrator_norm_loss_value = latent_calibrator_norm_loss(
+                            delta=latent_calibrator_delta,
+                            mask=latent_calibrator_mask,
+                            norm_cap=latent_calibrator_settings.residual_norm_cap,
+                        )
 
                     assert frame_embeds.shape == pooled_prompt_embeds.shape
                     assert modified_pooled_prompt_embeds.shape == pooled_prompt_embeds.shape
@@ -1465,9 +1971,38 @@ def main() -> None:
                                     if latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT
                                     else None
                                 ),
+                                "image_first_bridge_mode": (
+                                    image_first_bridge_mode
+                                    if latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT
+                                    else None
+                                ),
                                 "image_first_shared_noise_fraction": (
                                     image_first_shared_noise_fraction
                                     if latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT
+                                    else None
+                                ),
+                                "image_first_bridge_fraction": (
+                                    image_first_bridge_fraction
+                                    if latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT
+                                    else None
+                                ),
+                                "image_first_rollout_steps": (
+                                    image_first_rollout_steps
+                                    if (
+                                        latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT
+                                        and image_first_uses_rollout_bridge
+                                    )
+                                    else None
+                                ),
+                                "latent_calibrator_enabled": latent_calibrator is not None,
+                                "latent_calibrator_map_loss": (
+                                    float(latent_calibrator_map_loss.detach().float().item())
+                                    if latent_calibrator is not None
+                                    else None
+                                ),
+                                "latent_calibrator_norm_loss": (
+                                    float(latent_calibrator_norm_loss_value.detach().float().item())
+                                    if latent_calibrator is not None
                                     else None
                                 ),
                                 "video_timesteps": tuple(timesteps.reshape(batch_size, num_frames)[:, 0].shape),
@@ -1532,6 +2067,17 @@ def main() -> None:
                             noise_scheduler=noise_scheduler,
                             timesteps=timesteps,
                         )
+                        if (
+                            image_first_uses_snr_gate
+                            and bridge_mask is not None
+                            and standard_noise is not None
+                        ):
+                            mask = _expand_latent_mask(bridge_mask, target)
+                            target = torch.where(
+                                mask,
+                                target,
+                                standard_noise.to(device=target.device, dtype=target.dtype),
+                            )
                     elif prediction_type == "epsilon":
                         target = noise
                     elif prediction_type == "v_prediction":
@@ -1549,6 +2095,12 @@ def main() -> None:
                         timesteps=timesteps,
                         snr_gamma=snr_gamma,
                     )
+                    if latent_calibrator is not None:
+                        loss = loss + float(latent_calibrator_settings.map_weight) * latent_calibrator_map_loss
+                        loss = loss + (
+                            float(latent_calibrator_settings.norm_weight)
+                            * latent_calibrator_norm_loss_value
+                        )
                     accumulated_loss = accumulated_loss + loss.detach().float()
                     accumulated_loss_count += 1
                     accelerator.backward(loss)
@@ -1605,6 +2157,19 @@ def main() -> None:
                                 image_first_shared_noise_fraction
                             )
                             metrics["train/image_first_shared_noise_prob"] = image_first_shared_noise_prob
+                            metrics["train/image_first_bridge_fraction"] = image_first_bridge_fraction
+                            if image_first_uses_rollout_bridge:
+                                metrics["train/image_first_rollout_steps"] = image_first_rollout_steps
+                        if latent_calibrator is not None:
+                            metrics["train/latent_calibrator_map_loss"] = (
+                                latent_calibrator_map_loss.detach().float().item()
+                            )
+                            metrics["train/latent_calibrator_norm_loss"] = (
+                                latent_calibrator_norm_loss_value.detach().float().item()
+                            )
+                            metrics["train/latent_calibrator_map_weight"] = (
+                                float(latent_calibrator_settings.map_weight)
+                            )
                         if gpu_memory_mb is not None:
                             metrics["system/gpu_max_memory_allocated_mb"] = gpu_memory_mb
                         if tracker_is_enabled(config):
@@ -1654,6 +2219,7 @@ def main() -> None:
                             vae=vae,
                             temporal_mlp=temporal_mlp,
                             frame_position_encoder=frame_position_encoder,
+                            latent_calibrator=latent_calibrator,
                             config=config,
                             temporal_config=temporal_config,
                             progress_bar=progress_bar,
@@ -1682,6 +2248,11 @@ def main() -> None:
                                 if frame_position_encoder is not None
                                 else None
                             )
+                            validation_latent_calibrator = (
+                                accelerator.unwrap_model(latent_calibrator)
+                                if latent_calibrator is not None
+                                else None
+                            )
                             if latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT:
                                 guidance_scale = float(validation_config.get("guidance_scale", 8.0))
                                 switch_noise_scale = float(validation_config.get("switch_noise_scale", 0.1))
@@ -1700,6 +2271,8 @@ def main() -> None:
                                         pipe=pipe,
                                         temporal_mlp=validation_temporal_mlp,
                                         frame_position_encoder=validation_frame_position_encoder,
+                                        latent_calibrator=validation_latent_calibrator,
+                                        latent_calibrator_config=latent_calibrator_config,
                                         prompt=validation_config["prompt"],
                                         num_frames=int(validation_config["num_frames"]),
                                         output_dir=guidance_validation_dir,
@@ -1812,6 +2385,7 @@ def main() -> None:
         vae=vae,
         temporal_mlp=temporal_mlp,
         frame_position_encoder=frame_position_encoder,
+        latent_calibrator=latent_calibrator,
         config=config,
         temporal_config=temporal_config,
     )

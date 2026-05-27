@@ -36,6 +36,19 @@ adapters without replacing the pretrained SDXL backbone.
 - `configs/train/image_first_mixed.yaml` adds mixed image-first noising:
   per video, some samples use frame-shared noise and the rest use
   frame-independent noise.
+- `configs/train/image_first_snr.yaml` adds SNR-gated image-first bridging:
+  high-SNR/near-clean timesteps use standard video noising instead of forcing
+  a large anchor-to-video correction.
+- `configs/train/image_first_snr_ea.yaml` enables the zero-init temporal-conv
+  latent calibrator on top of the SNR-gated bridge. The calibrator adjusts
+  anchor-expanded noisy latents before the UNet/video adapters and can add a
+  weak low-frequency map-alignment auxiliary loss.
+- `configs/train/image_first_rollout.yaml` adds rollout-source image-first
+  training: the anchor is noised, denoised for a few base-SDXL steps with video
+  adapters inactive, then duplicated across frames before the video loss.
+- `configs/train/image_first_rollout_snr.yaml` combines the rollout source with
+  SNR-gated fallback: bridged timesteps use the rollout source, while timesteps
+  outside the configured SNR range use standard video DDPM noising.
 - Image-first validation/inference supports `switch_noise_scale`, which adds
   small frame-wise perturbation after duplicating the image latent.
 
@@ -53,6 +66,8 @@ adapters without replacing the pretrained SDXL backbone.
 - `framegen/sdxl.py`: SDXL prompt encoding, time IDs, pooled temporal MLP.
 - `framegen/data.py`: placeholder and OpenVid video datasets.
 - `framegen/temporal.py`: frame position encoders and token conditioning modes.
+- `framegen/latent_calibrator.py`: anchor-expanded latent calibration module
+  and auxiliary losses.
 - `framegen/video_resnet.py`: ResnetBlock2D video adapter.
 - `framegen/video_attention.py`: BasicTransformerBlock video adapter.
 - `train.py`: training wiring.
@@ -69,6 +84,8 @@ adapters without replacing the pretrained SDXL backbone.
 - `information/9_loss_and_timestep_schedule.md`: training loss, noise target, and timestep sampling.
 - `information/10_image_first_training.md`: first-frame-repeat objective,
   validation split, configs, and inference entrypoint.
+- `information/11_latent_calibrator.md`: latent calibrator architecture,
+  training path, and inference behavior.
 
 ## Verified SDXL Backbone
 

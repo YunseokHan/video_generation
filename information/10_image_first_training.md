@@ -91,6 +91,88 @@ This is implemented by `compute_clean_latent_epsilon_target(...)`. The mode
 currently requires scheduler `prediction_type: epsilon`; `train.py` raises if a
 config tries to combine `first_frame_repeat` with `v_prediction` or `sample`.
 
+## Bridge Source Modes
+
+The image-first source distribution is controlled by:
+
+```yaml
+training:
+  image_first_bridge_mode: "always"  # always | snr | rollout | rollout_snr
+```
+
+`always` is the original objective: every sampled timestep corrupts the
+repeated first-frame latent and uses the clean-video epsilon target above.
+
+`snr` is the SNR-gated hybrid objective used by
+`configs/train/image_first_snr.yaml` and
+`configs/train/image_first_snr_ea.yaml`:
+
+```yaml
+training:
+  image_first_bridge_mode: "snr"
+  image_first_bridge_snr_min: null
+  image_first_bridge_snr_max: 5.0
+```
+
+For each sampled video timestep, `train.py` computes SNR. Timesteps inside the
+configured range use the anchor bridge. Timesteps outside the range use
+standard video DDPM noising:
+
+```text
+if SNR(t) <= image_first_bridge_snr_max:
+  z_t    = q(z_t | [z*1, ..., z*1])
+  target = epsilon_to_reconstruct(z*)
+else:
+  z_t    = q(z_t | z*)
+  target = sampled epsilon
+```
+
+This avoids forcing the model to learn the large
+`sqrt(SNR(t)) * ([z*1, ..., z*1] - z*)` correction at near-clean timesteps.
+
+`image_first_snr_ea.yaml` additionally enables `latent_calibrator`, a
+zero-init temporal-conv residual mapper that is applied to bridged
+anchor-expanded noisy latents before the UNet/video adapters. It uses the same
+bridge noise to form a weak low-frequency target
+`q(z_t | z*)`, so the auxiliary loss aligns deterministic anchor-to-video
+latent shift rather than independent noise.
+
+`rollout` is the rollout-source objective used by
+`configs/train/image_first_rollout.yaml`. `rollout_snr` is the same rollout
+source with SNR-gated fallback and is used by
+`configs/train/image_first_rollout_snr.yaml`:
+
+```yaml
+training:
+  image_first_bridge_mode: "rollout"      # or "rollout_snr"
+  image_first_bridge_snr_max: 5.0         # used by rollout_snr
+  image_first_rollout_steps: 4
+  image_first_rollout_switch_noise_scale: 0.1
+```
+
+For each video, the first-frame anchor is noised at
+`target_t + image_first_rollout_steps` and then denoised down to `target_t`
+with the base SDXL UNet while UNet video Resnet and attention adapters are
+inactive. The resulting image latent is duplicated across frames. Optional
+frame-wise switch noise is added after duplication to mirror image-first
+inference:
+
+```text
+z_img,target = base_sdxl_rollout(q(z*1, target_t + K), target_t)
+z_t          = [z_img,target, ..., z_img,target] + switch_noise
+target       = epsilon_to_reconstruct(z*)
+```
+
+The rollout switch noise level is one scalar per video timestep, repeated over
+frames as `[B*F, 1, 1, 1]` and broadcast over latent channels/spatial
+dimensions. It must not be reshaped to the full `[B*F, C, H, W]` latent shape.
+
+This makes training inputs closer to the intermediate image latents that
+`generate_image_first_video_frames(...)` produces at the image-to-video switch.
+For `rollout_snr`, timesteps outside the configured SNR range do not use the
+rollout source in the loss path; they use standard video DDPM noising plus the
+sampled epsilon target.
+
 ## Validation Logic
 
 When `latent_init_mode: first_frame_repeat`, `train.py` switches validation from
@@ -228,5 +310,54 @@ uses:
 configs/train/image_first_learnable_frame_tokens.yaml
 ```
 
-Both configs keep the base SDXL image model frozen by default and train only
-the added temporal/adaptor parameters configured in `video_adapters`.
+SNR-gated hybrid bridge:
+
+```bash
+bash scripts/train_image_first_snr.sh
+```
+
+uses:
+
+```text
+configs/train/image_first_snr.yaml
+```
+
+SNR-gated hybrid bridge with latent calibrator:
+
+```bash
+bash scripts/train_image_first_snr_ea.sh
+```
+
+uses:
+
+```text
+configs/train/image_first_snr_ea.yaml
+```
+
+Rollout-source bridge:
+
+```bash
+bash scripts/train_image_first_rollout.sh
+```
+
+uses:
+
+```text
+configs/train/image_first_rollout.yaml
+```
+
+Rollout-source bridge with SNR-gated fallback:
+
+```bash
+bash scripts/train_image_first_rollout_snr.sh
+```
+
+uses:
+
+```text
+configs/train/image_first_rollout_snr.yaml
+```
+
+All image-first configs keep the base SDXL image model frozen by default and
+train only the added temporal/adaptor parameters configured in
+`video_adapters`.

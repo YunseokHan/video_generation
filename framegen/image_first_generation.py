@@ -132,6 +132,8 @@ def generate_image_first_video_frames(
     pipe,
     temporal_mlp,
     frame_position_encoder,
+    latent_calibrator,
+    latent_calibrator_config: dict | None,
     prompt: str,
     num_frames: int,
     output_dir: str | Path,
@@ -228,7 +230,8 @@ def generate_image_first_video_frames(
             )
             latents = pipe.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
 
-        latents = latents.expand(int(num_frames), -1, -1, -1).contiguous()
+        anchor_latents = latents.expand(int(num_frames), -1, -1, -1).contiguous()
+        latents = anchor_latents
         if float(switch_noise_scale) > 0.0 and first_stage_steps < len(timesteps):
             switch_noise_level = _scheduler_switch_noise_level(
                 scheduler=pipe.scheduler,
@@ -308,6 +311,22 @@ def generate_image_first_video_frames(
             device=device,
             dtype=pooled_prompt_embeds_vid.dtype,
         )
+
+        if latent_calibrator is not None and first_stage_steps < len(timesteps):
+            calibrator_config = dict(latent_calibrator_config or {})
+            apply_mode = str(calibrator_config.get("apply_mode", "switch_only"))
+            if apply_mode != "switch_only":
+                raise ValueError("Only latent_calibrator.apply_mode='switch_only' is supported for inference.")
+            switch_timestep = timesteps[first_stage_steps].repeat(int(num_frames))
+            latents, _, _ = latent_calibrator(
+                noisy_latents=latents,
+                anchor_latents=anchor_latents,
+                timesteps=switch_timestep,
+                frame_positions=frame_positions,
+                pooled_prompt_embeds=pooled_prompt_embeds_vid,
+                num_frames=int(num_frames),
+                noise_scheduler=pipe.scheduler,
+            )
 
         set_video_resnet_context(
             pipe.unet,

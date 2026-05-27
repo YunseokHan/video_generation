@@ -20,6 +20,7 @@ from framegen.checkpointing import (
     VIDEO_ATTENTION_ADAPTER_FILENAME,
     VIDEO_RESNET_ADAPTER_FILENAME,
     load_frame_position_encoder_checkpoint,
+    load_latent_calibrator_checkpoint,
     load_temporal_mlp_checkpoint,
     load_vae_decoder_resnet_adapter_checkpoint,
     load_video_attention_adapter_checkpoint,
@@ -268,9 +269,27 @@ def load_image_first_pipeline(
             frame_position_encoder.to(device=device)
         frame_position_encoder.eval()
 
+    latent_calibrator, latent_calibrator_config = load_latent_calibrator_checkpoint(
+        checkpoint_dir,
+        map_location="cpu",
+    )
+    if latent_calibrator_config is None:
+        latent_calibrator_config = dict(config.get("latent_calibrator", {}))
+    if latent_calibrator is not None:
+        latent_calibrator.to(device=device, dtype=torch_dtype)
+        latent_calibrator.eval()
+
     pipe.to(device)
     pipe.set_progress_bar_config(disable=False)
-    return pipe, temporal_mlp, temporal_config, frame_position_encoder, frame_encoder_config
+    return (
+        pipe,
+        temporal_mlp,
+        temporal_config,
+        frame_position_encoder,
+        frame_encoder_config,
+        latent_calibrator,
+        latent_calibrator_config,
+    )
 
 
 def main() -> None:
@@ -301,7 +320,15 @@ def main() -> None:
     torch_dtype = get_torch_dtype(model_config.get("dtype", "bf16"))
     vae_dtype = get_torch_dtype(model_config.get("vae_dtype", model_config.get("dtype", "bf16")))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pipe, temporal_mlp, temporal_config, frame_position_encoder, frame_encoder_config = (
+    (
+        pipe,
+        temporal_mlp,
+        temporal_config,
+        frame_position_encoder,
+        frame_encoder_config,
+        latent_calibrator,
+        latent_calibrator_config,
+    ) = (
         load_image_first_pipeline(
             args=args,
             config=config,
@@ -335,6 +362,8 @@ def main() -> None:
         pipe=pipe,
         temporal_mlp=temporal_mlp,
         frame_position_encoder=frame_position_encoder,
+        latent_calibrator=latent_calibrator,
+        latent_calibrator_config=latent_calibrator_config,
         prompt=str(prompt),
         num_frames=int(num_frames),
         output_dir=output_dir,
