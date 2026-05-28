@@ -9,7 +9,7 @@ model:
 
 data:
   dataset_type: "openvid"
-  openvid_root: "/NHNHOME/WORKSPACE/26moe001_D/dataset/OpenVid-1M/OpenVid_extracted"
+  openvid_root: "/home/work/data/yunseok/video_generation/datasets/OpenVid_extracted"
   openvid_csv: null
   openvid_sources: null
   openvid_max_videos: null
@@ -77,14 +77,14 @@ latent_calibrator:
 video_adapters:
   frame_position_encoder:
     enabled: true
-    type: "learned_tokens"
-    train: true
-    token_embedding_mode: "concat_tokens"
+    type: "sinusoidal"
+    train: false
+    token_embedding_mode: "add_to_text"
     alpha: 1.0
     embedding_dim: 2048
     hidden_dim: 1024
     num_layers: 2
-    num_tokens: 4
+    num_tokens: 1
     pooling: "mean"
   vae_decoder_resnet:
     enabled: true
@@ -115,8 +115,8 @@ video_adapters:
     include_prompt_tokens: true
 
 training:
-  output_dir: "outputs/image-first-learnable-frame-tokens-res512-bs5"
-  train_batch_size: 5
+  output_dir: "outputs/image-first-smooth-snr"
+  train_batch_size: 4
   gradient_accumulation_steps: 4
   learning_rate: 1.0e-5
   scale_lr: false
@@ -138,9 +138,9 @@ training:
   latent_init_mode: "first_frame_repeat"
   image_first_noise_mode: "independent"
   image_first_shared_noise_prob: 0.5
-  image_first_bridge_mode: "always"
+  image_first_bridge_mode: "smooth_snr"
   image_first_bridge_snr_min: null
-  image_first_bridge_snr_max: null
+  image_first_bridge_snr_max: 5.0
   image_first_bridge_snr_full: 1.0
   image_first_bridge_snr_zero: 5.0
   image_first_bridge_gate: "cosine"
@@ -172,10 +172,10 @@ logging:
   report_to: "wandb"
   project: "sdxl-frame-generator"
   entity: null
-  run_name: "image-first-learnable-frame-tokens-res512-bs5"
+  run_name: "image-first-smooth-snr"
   group: null
   job_type: "train"
-  tags: ["sdxl", "frame-generator", "image-first", "learnable-frame-tokens"]
+  tags: ["sdxl", "frame-generator", "image-first", "smooth-snr", "sinusoidal-frame-tokens"]
   notes: null
   log_validation_media: true
   log_training_caption_inference: false

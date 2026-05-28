@@ -39,6 +39,8 @@ adapters without replacing the pretrained SDXL backbone.
 - `configs/train/image_first_snr.yaml` adds SNR-gated image-first bridging:
   high-SNR/near-clean timesteps use standard video noising instead of forcing
   a large anchor-to-video correction.
+- `configs/train/image_first_snr_renoise.yaml` keeps the hard SNR bridge and
+  changes validation/inference to pred-x0 matched re-noising at the switch.
 - `configs/train/image_first_snr_ea.yaml` enables the zero-init temporal-conv
   latent calibrator on top of the SNR-gated bridge. The calibrator adjusts
   anchor-expanded noisy latents before the UNet/video adapters and can add a
@@ -49,8 +51,20 @@ adapters without replacing the pretrained SDXL backbone.
 - `configs/train/image_first_rollout_snr.yaml` combines the rollout source with
   SNR-gated fallback: bridged timesteps use the rollout source, while timesteps
   outside the configured SNR range use standard video DDPM noising.
+- `configs/train/image_first_smooth_snr_renoise_boundary.yaml` adds a
+  smooth-SNR image-first bridge. It cosine-blends the anchor source into the
+  standard video source, adds a boundary re-noising auxiliary loss, and
+  validates with pred-x0 matched re-noising at the image-to-video switch.
+- `configs/train/image_first_smooth_snr.yaml` and
+  `configs/train/image_first_smooth_snr_boundary.yaml` expose the same
+  smooth-SNR bridge without pred-x0 re-noise, either without or with the
+  boundary auxiliary loss.
 - Image-first validation/inference supports `switch_noise_scale`, which adds
   small frame-wise perturbation after duplicating the image latent.
+- Image-first validation/inference also supports
+  `image_first_switch_mode: "pred_x0_renoise"`, which predicts the clean image
+  latent at the switch point and re-noises it with frame-wise scheduler noise
+  before video denoising.
 
 ## Not Fully Implemented
 

@@ -141,6 +141,14 @@ training:
   image_first_bridge_mode: "rollout_snr"
   image_first_bridge_snr_min: null
   image_first_bridge_snr_max: 5.0
+  image_first_bridge_snr_full: 1.0
+  image_first_bridge_snr_zero: 5.0
+  image_first_bridge_gate: "cosine"
+  image_first_bridge_gate_domain: "log_snr"
+  image_first_boundary_loss_weight: 0.0
+  image_first_boundary_snr: null
+  image_first_boundary_lowfreq_only: true
+  image_first_boundary_downsample_factor: 4
   image_first_rollout_steps: 4
   image_first_rollout_noise_offset: 0.0
   image_first_rollout_switch_noise_scale: 0.1
@@ -204,5 +212,8 @@ validation:
   guidance_scales: [1.0, 8.0]
   t1_ratios: [0.0, 0.25, 0.5, 0.75]
   switch_noise_scale: 0.1
+  image_first_switch_mode: "repeat_add_noise"
+  image_first_renoise_noise_mode: "independent"
+  image_first_renoise_noise_scale: 1.0
   fps: 8
   batch_size: null

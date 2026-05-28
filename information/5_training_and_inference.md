@@ -187,9 +187,13 @@ configs/train/image_first_mixed.yaml
 configs/train/image_first_sinusoidal.yaml
 configs/train/image_first_learnable_frame_tokens.yaml
 configs/train/image_first_snr.yaml
+configs/train/image_first_snr_renoise.yaml
 configs/train/image_first_snr_ea.yaml
 configs/train/image_first_rollout.yaml
 configs/train/image_first_rollout_snr.yaml
+configs/train/image_first_smooth_snr.yaml
+configs/train/image_first_smooth_snr_boundary.yaml
+configs/train/image_first_smooth_snr_renoise_boundary.yaml
 ```
 
 Launch them with:
@@ -199,9 +203,13 @@ bash scripts/train_image_first.sh
 bash scripts/train_image_first_sinusoidal.sh
 bash scripts/train_image_first_learnable.sh
 bash scripts/train_image_first_snr.sh
+bash scripts/train_image_first_snr_renoise.sh
 bash scripts/train_image_first_snr_ea.sh
 bash scripts/train_image_first_rollout.sh
 bash scripts/train_image_first_rollout_snr.sh
+bash scripts/train_image_first_smooth_snr.sh
+bash scripts/train_image_first_smooth_snr_boundary.sh
+bash scripts/train_image_first_smooth_snr_renoise_boundary.sh
 ```
 
 These configs validate with CFG 8 only and run `t1` ratios
@@ -222,6 +230,13 @@ path and default `validation.switch_noise_scale: 0.1`.
 `training.image_first_bridge_snr_max: 5.0`, so timesteps above that SNR use
 standard video DDPM noising/epsilon targets instead of the anchor bridge.
 
+`scripts/train_image_first_snr_renoise.sh` launches
+`configs/train/image_first_snr_renoise.yaml`. It keeps the same hard SNR
+training bridge as `image_first_snr.yaml`, but uses
+`validation.image_first_switch_mode: "pred_x0_renoise"` so validation converts
+the image switch latent to `pred_x0` and re-noises it at the scheduler switch
+level.
+
 `scripts/train_image_first_snr_ea.sh` launches
 `configs/train/image_first_snr_ea.yaml`. It keeps the same SNR-gated bridge and
 enables `latent_calibrator`, a zero-init temporal-conv residual mapper applied
@@ -240,6 +255,24 @@ then duplicates that source latent across frames.
 `training.image_first_bridge_snr_max: 5.0`, so bridged timesteps use the
 rollout source while higher-SNR timesteps fall back to standard video DDPM
 noising/epsilon targets.
+
+`scripts/train_image_first_smooth_snr.sh` launches
+`configs/train/image_first_smooth_snr.yaml`. It sets
+`training.image_first_bridge_mode: "smooth_snr"` and uses a cosine gate from
+SNR 1 to SNR 5, without boundary loss or pred-x0 re-noise validation.
+
+`scripts/train_image_first_smooth_snr_boundary.sh` launches
+`configs/train/image_first_smooth_snr_boundary.yaml`. It adds the weak boundary
+re-noising loss at SNR 5 to the smooth-SNR bridge, while keeping the legacy
+repeat-add-noise validation switch.
+
+`scripts/train_image_first_smooth_snr_renoise_boundary.sh` launches
+`configs/train/image_first_smooth_snr_renoise_boundary.yaml`. It sets
+`training.image_first_bridge_mode: "smooth_snr"`, uses a cosine gate from
+SNR 1 to SNR 5 to transition from anchor-source noising to standard video
+noising, adds a weak boundary re-noising loss at SNR 5, and uses
+`validation.image_first_switch_mode: "pred_x0_renoise"` for matched
+image-to-video switch inputs.
 
 `global_step` is an optimizer-step counter, not a dataloader microbatch counter.
 With `train_batch_size: 1`, `gradient_accumulation_steps: 4`,

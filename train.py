@@ -90,6 +90,7 @@ IMAGE_FIRST_NOISE_SHARED = "shared"
 IMAGE_FIRST_NOISE_MIXED = "mixed"
 IMAGE_FIRST_BRIDGE_ALWAYS = "always"
 IMAGE_FIRST_BRIDGE_SNR = "snr"
+IMAGE_FIRST_BRIDGE_SMOOTH_SNR = "smooth_snr"
 IMAGE_FIRST_BRIDGE_ROLLOUT = "rollout"
 IMAGE_FIRST_BRIDGE_ROLLOUT_SNR = "rollout_snr"
 
@@ -157,6 +158,10 @@ def normalize_image_first_bridge_mode(mode: str | None) -> str:
         "snr": IMAGE_FIRST_BRIDGE_SNR,
         "snr_hybrid": IMAGE_FIRST_BRIDGE_SNR,
         "snr_gated": IMAGE_FIRST_BRIDGE_SNR,
+        "smooth_snr": IMAGE_FIRST_BRIDGE_SMOOTH_SNR,
+        "soft_snr": IMAGE_FIRST_BRIDGE_SMOOTH_SNR,
+        "cosine_snr": IMAGE_FIRST_BRIDGE_SMOOTH_SNR,
+        "smooth_snr_bridge": IMAGE_FIRST_BRIDGE_SMOOTH_SNR,
         "rollout": IMAGE_FIRST_BRIDGE_ROLLOUT,
         "image_rollout": IMAGE_FIRST_BRIDGE_ROLLOUT,
         "anchor_rollout": IMAGE_FIRST_BRIDGE_ROLLOUT,
@@ -167,7 +172,8 @@ def normalize_image_first_bridge_mode(mode: str | None) -> str:
     }
     if normalized not in aliases:
         raise ValueError(
-            "training.image_first_bridge_mode must be one of always, snr, rollout, or rollout_snr, "
+            "training.image_first_bridge_mode must be one of always, snr, smooth_snr, "
+            "rollout, or rollout_snr, "
             f"got {mode!r}."
         )
     return aliases[normalized]
@@ -449,6 +455,110 @@ def compute_image_first_bridge_mask(
     if snr_max is not None:
         mask = mask & (snr <= float(snr_max))
     return mask
+
+
+def compute_image_first_smooth_snr_gate(
+    noise_scheduler: DDPMScheduler,
+    timesteps: torch.Tensor,
+    snr_full: float,
+    snr_zero: float,
+    gate_mode: str = "cosine",
+    domain: str = "log_snr",
+) -> torch.Tensor:
+    """Return a soft bridge gate that is 1 at low SNR and 0 at high SNR."""
+    full = float(snr_full)
+    zero = float(snr_zero)
+    if full <= 0.0 or zero <= 0.0:
+        raise ValueError("smooth SNR gate thresholds must be positive.")
+    if full >= zero:
+        raise ValueError("training.image_first_bridge_snr_full must be < image_first_bridge_snr_zero.")
+
+    snr = compute_snr(noise_scheduler, timesteps).float()
+    normalized_domain = str(domain or "log_snr").lower().replace("-", "_")
+    if normalized_domain in {"log", "log_snr", "logsnr"}:
+        start = math.log(max(full, 1.0e-12))
+        stop = math.log(max(zero, 1.0e-12))
+        position = (snr.clamp_min(1.0e-12).log() - start) / max(stop - start, 1.0e-12)
+    elif normalized_domain in {"linear", "snr"}:
+        position = (snr - full) / max(zero - full, 1.0e-12)
+    else:
+        raise ValueError("training.image_first_bridge_gate_domain must be 'log_snr' or 'snr'.")
+    position = position.clamp(0.0, 1.0)
+
+    normalized_gate = str(gate_mode or "cosine").lower().replace("-", "_")
+    if normalized_gate == "cosine":
+        return 0.5 * (1.0 + torch.cos(math.pi * position))
+    if normalized_gate == "linear":
+        return 1.0 - position
+    raise ValueError("training.image_first_bridge_gate must be 'cosine' or 'linear'.")
+
+
+def timestep_closest_to_snr(
+    noise_scheduler: DDPMScheduler,
+    target_snr: float,
+    device: torch.device,
+) -> torch.Tensor:
+    if float(target_snr) <= 0.0:
+        raise ValueError("target_snr must be positive.")
+    alphas_cumprod = noise_scheduler.alphas_cumprod.float()
+    snr = alphas_cumprod / (1.0 - alphas_cumprod).clamp_min(1.0e-12)
+    target = math.log(max(float(target_snr), 1.0e-12))
+    timestep = torch.argmin((snr.clamp_min(1.0e-12).log() - target).abs())
+    return timestep.to(device=device, dtype=torch.long)
+
+
+def predict_clean_latents_from_epsilon(
+    noisy_latents: torch.Tensor,
+    epsilon: torch.Tensor,
+    noise_scheduler: DDPMScheduler,
+    timesteps: torch.Tensor,
+) -> torch.Tensor:
+    alphas_cumprod = noise_scheduler.alphas_cumprod.to(
+        device=noisy_latents.device,
+        dtype=torch.float32,
+    )
+    alpha_prod_t = alphas_cumprod[timesteps]
+    while alpha_prod_t.ndim < noisy_latents.ndim:
+        alpha_prod_t = alpha_prod_t.unsqueeze(-1)
+    sqrt_alpha_prod = alpha_prod_t.clamp_min(1.0e-12).sqrt()
+    sqrt_one_minus_alpha_prod = (1.0 - alpha_prod_t).clamp_min(1.0e-12).sqrt()
+    return (noisy_latents.float() - sqrt_one_minus_alpha_prod * epsilon.float()) / sqrt_alpha_prod
+
+
+def compute_boundary_renoise_loss(
+    pred_clean_latents: torch.Tensor,
+    clean_latents: torch.Tensor,
+    boundary_noise: torch.Tensor,
+    noise_scheduler: DDPMScheduler,
+    boundary_timestep: torch.Tensor,
+    sample_weights: torch.Tensor | None = None,
+    lowfreq_only: bool = True,
+    downsample_factor: int = 4,
+) -> torch.Tensor:
+    batch = clean_latents.shape[0]
+    timesteps = boundary_timestep.reshape(1).repeat(batch).to(
+        device=clean_latents.device,
+        dtype=torch.long,
+    )
+    pred_boundary = noise_scheduler.add_noise(
+        pred_clean_latents.float(),
+        boundary_noise.float(),
+        timesteps,
+    )
+    target_boundary = noise_scheduler.add_noise(
+        clean_latents.float(),
+        boundary_noise.float(),
+        timesteps,
+    ).detach()
+    if bool(lowfreq_only) and int(downsample_factor) > 1:
+        factor = int(downsample_factor)
+        pred_boundary = torch_f.avg_pool2d(pred_boundary, kernel_size=factor, stride=factor)
+        target_boundary = torch_f.avg_pool2d(target_boundary, kernel_size=factor, stride=factor)
+    per_sample = (pred_boundary - target_boundary).square().mean(dim=list(range(1, pred_boundary.ndim)))
+    if sample_weights is None:
+        return per_sample.mean()
+    weights = sample_weights.to(device=per_sample.device, dtype=per_sample.dtype).reshape_as(per_sample)
+    return (per_sample * weights).sum() / weights.sum().clamp_min(1.0e-12)
 
 
 def _expand_latent_mask(mask: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
@@ -1165,6 +1275,14 @@ def main() -> None:
     training_config.setdefault("image_first_bridge_mode", IMAGE_FIRST_BRIDGE_ALWAYS)
     training_config.setdefault("image_first_bridge_snr_min", None)
     training_config.setdefault("image_first_bridge_snr_max", None)
+    training_config.setdefault("image_first_bridge_snr_full", 1.0)
+    training_config.setdefault("image_first_bridge_snr_zero", 5.0)
+    training_config.setdefault("image_first_bridge_gate", "cosine")
+    training_config.setdefault("image_first_bridge_gate_domain", "log_snr")
+    training_config.setdefault("image_first_boundary_loss_weight", 0.0)
+    training_config.setdefault("image_first_boundary_snr", None)
+    training_config.setdefault("image_first_boundary_lowfreq_only", True)
+    training_config.setdefault("image_first_boundary_downsample_factor", 4)
     training_config.setdefault("image_first_rollout_steps", 0)
     training_config.setdefault("image_first_rollout_noise_offset", 0.0)
     training_config.setdefault("image_first_rollout_switch_noise_scale", 0.0)
@@ -1298,6 +1416,7 @@ def main() -> None:
         IMAGE_FIRST_BRIDGE_SNR,
         IMAGE_FIRST_BRIDGE_ROLLOUT_SNR,
     }
+    image_first_uses_smooth_snr_bridge = image_first_bridge_mode == IMAGE_FIRST_BRIDGE_SMOOTH_SNR
     image_first_shared_noise_prob = float(training_config.get("image_first_shared_noise_prob", 0.5))
     if not 0.0 <= image_first_shared_noise_prob <= 1.0:
         raise ValueError("training.image_first_shared_noise_prob must be in [0, 1].")
@@ -1309,6 +1428,49 @@ def main() -> None:
         and image_first_bridge_snr_min > image_first_bridge_snr_max
     ):
         raise ValueError("training.image_first_bridge_snr_min must be <= image_first_bridge_snr_max.")
+    image_first_bridge_snr_full = _optional_float(training_config.get("image_first_bridge_snr_full"))
+    image_first_bridge_snr_zero = _optional_float(training_config.get("image_first_bridge_snr_zero"))
+    image_first_bridge_gate = str(training_config.get("image_first_bridge_gate", "cosine"))
+    image_first_bridge_gate_domain = str(training_config.get("image_first_bridge_gate_domain", "log_snr"))
+    if image_first_uses_smooth_snr_bridge:
+        if image_first_bridge_snr_full is None or image_first_bridge_snr_zero is None:
+            raise ValueError(
+                "training.image_first_bridge_snr_full and image_first_bridge_snr_zero are required "
+                "for image_first_bridge_mode='smooth_snr'."
+            )
+        if image_first_bridge_snr_full >= image_first_bridge_snr_zero:
+            raise ValueError(
+                "training.image_first_bridge_snr_full must be < image_first_bridge_snr_zero."
+            )
+        compute_image_first_smooth_snr_gate(
+            noise_scheduler=noise_scheduler,
+            timesteps=torch.tensor([0], dtype=torch.long),
+            snr_full=image_first_bridge_snr_full,
+            snr_zero=image_first_bridge_snr_zero,
+            gate_mode=image_first_bridge_gate,
+            domain=image_first_bridge_gate_domain,
+        )
+    image_first_boundary_loss_weight = float(training_config.get("image_first_boundary_loss_weight", 0.0))
+    if image_first_boundary_loss_weight < 0.0:
+        raise ValueError("training.image_first_boundary_loss_weight must be non-negative.")
+    image_first_boundary_snr = _optional_float(training_config.get("image_first_boundary_snr"))
+    if image_first_boundary_snr is None:
+        image_first_boundary_snr = image_first_bridge_snr_zero
+    if image_first_boundary_loss_weight > 0.0 and image_first_boundary_snr is None:
+        raise ValueError("training.image_first_boundary_snr is required when boundary loss is enabled.")
+    image_first_boundary_lowfreq_only = bool(training_config.get("image_first_boundary_lowfreq_only", True))
+    image_first_boundary_downsample_factor = int(
+        training_config.get("image_first_boundary_downsample_factor", 4)
+    )
+    if image_first_boundary_downsample_factor < 1:
+        raise ValueError("training.image_first_boundary_downsample_factor must be >= 1.")
+    image_first_boundary_timestep = None
+    if image_first_boundary_loss_weight > 0.0:
+        image_first_boundary_timestep = timestep_closest_to_snr(
+            noise_scheduler=noise_scheduler,
+            target_snr=float(image_first_boundary_snr),
+            device=accelerator.device,
+        )
     image_first_rollout_steps = int(training_config.get("image_first_rollout_steps", 0))
     if image_first_rollout_steps < 0:
         raise ValueError("training.image_first_rollout_steps must be non-negative.")
@@ -1485,6 +1647,9 @@ def main() -> None:
             "  image-first bridge: "
             f"mode={image_first_bridge_mode}, noise_mode={image_first_noise_mode}, "
             f"snr_min={image_first_bridge_snr_min}, snr_max={image_first_bridge_snr_max}, "
+            f"smooth_full={image_first_bridge_snr_full}, smooth_zero={image_first_bridge_snr_zero}, "
+            f"smooth_gate={image_first_bridge_gate}, boundary_weight={image_first_boundary_loss_weight}, "
+            f"boundary_snr={image_first_boundary_snr}, "
             f"rollout_steps={image_first_rollout_steps}, "
             f"rollout_switch_noise_scale={image_first_rollout_switch_noise_scale}"
         )
@@ -1769,12 +1934,14 @@ def main() -> None:
                     standard_noise = None
                     image_first_shared_noise_fraction = 0.0
                     image_first_bridge_fraction = 0.0
+                    image_first_bridge_gate_values = None
                     bridge_mask = None
                     latent_calibrator_anchor_latents = None
                     latent_calibrator_alignment_target = None
                     latent_calibrator_mask = None
                     latent_calibrator_map_loss = clean_latents.new_zeros(())
                     latent_calibrator_norm_loss_value = clean_latents.new_zeros(())
+                    image_first_boundary_loss_value = clean_latents.new_zeros(())
                     if latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT:
                         if image_first_uses_rollout_bridge:
                             if prompt_embeds_image is None or pooled_prompt_embeds_image is None:
@@ -1879,24 +2046,48 @@ def main() -> None:
                                 snr_max=image_first_bridge_snr_max,
                             )
                             image_first_bridge_fraction = bridge_mask.float().mean().item()
-                            mask = _expand_latent_mask(bridge_mask, clean_latents)
-                            if image_first_bridge_mode == IMAGE_FIRST_BRIDGE_SNR:
-                                standard_noise = torch.randn_like(clean_latents)
-                                standard_noise = add_noise_offset(
-                                    standard_noise,
-                                    float(training_config.get("noise_offset", 0.0)),
+                            if image_first_uses_smooth_snr_bridge:
+                                if image_first_bridge_snr_full is None or image_first_bridge_snr_zero is None:
+                                    raise RuntimeError("smooth_snr bridge thresholds were not initialized.")
+                                image_first_bridge_gate_values = compute_image_first_smooth_snr_gate(
+                                    noise_scheduler=noise_scheduler,
+                                    timesteps=timesteps,
+                                    snr_full=image_first_bridge_snr_full,
+                                    snr_zero=image_first_bridge_snr_zero,
+                                    gate_mode=image_first_bridge_gate,
+                                    domain=image_first_bridge_gate_domain,
+                                ).to(device=clean_latents.device, dtype=clean_latents.dtype)
+                                image_first_bridge_fraction = (
+                                    image_first_bridge_gate_values.detach().float().mean().item()
                                 )
-                                noising_latents = torch.where(mask, anchor_noising_latents, clean_latents)
-                                noise = torch.where(mask, bridge_noise, standard_noise)
-                            else:
-                                noising_latents = anchor_noising_latents
+                                gate = image_first_bridge_gate_values
+                                while gate.ndim < clean_latents.ndim:
+                                    gate = gate.unsqueeze(-1)
+                                noising_latents = (
+                                    gate * anchor_noising_latents
+                                    + (1.0 - gate) * clean_latents
+                                )
                                 noise = bridge_noise
+                                bridge_mask = image_first_bridge_gate_values.detach() > 0.0
+                            else:
+                                mask = _expand_latent_mask(bridge_mask, clean_latents)
+                                if image_first_bridge_mode == IMAGE_FIRST_BRIDGE_SNR:
+                                    standard_noise = torch.randn_like(clean_latents)
+                                    standard_noise = add_noise_offset(
+                                        standard_noise,
+                                        float(training_config.get("noise_offset", 0.0)),
+                                    )
+                                    noising_latents = torch.where(mask, anchor_noising_latents, clean_latents)
+                                    noise = torch.where(mask, bridge_noise, standard_noise)
+                                else:
+                                    noising_latents = anchor_noising_latents
+                                    noise = bridge_noise
                             noisy_latents = noise_scheduler.add_noise(
                                 noising_latents,
                                 noise,
                                 timesteps,
                             ).to(dtype=torch_dtype)
-                            latent_calibrator_anchor_latents = anchor_noising_latents.to(dtype=torch_dtype)
+                            latent_calibrator_anchor_latents = noising_latents.to(dtype=torch_dtype)
                             latent_calibrator_alignment_target = noise_scheduler.add_noise(
                                 clean_latents,
                                 bridge_noise,
@@ -1984,6 +2175,16 @@ def main() -> None:
                                 "image_first_bridge_fraction": (
                                     image_first_bridge_fraction
                                     if latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT
+                                    else None
+                                ),
+                                "image_first_bridge_gate_mean": (
+                                    float(image_first_bridge_gate_values.detach().float().mean().item())
+                                    if image_first_bridge_gate_values is not None
+                                    else None
+                                ),
+                                "image_first_boundary_loss": (
+                                    float(image_first_boundary_loss_value.detach().float().item())
+                                    if image_first_boundary_loss_weight > 0.0
                                     else None
                                 ),
                                 "image_first_rollout_steps": (
@@ -2088,6 +2289,29 @@ def main() -> None:
                     else:
                         raise ValueError(f"Unsupported prediction_type={prediction_type!r}.")
 
+                    if (
+                        image_first_boundary_loss_weight > 0.0
+                        and latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT
+                        and image_first_boundary_timestep is not None
+                        and image_first_bridge_gate_values is not None
+                    ):
+                        pred_clean_latents = predict_clean_latents_from_epsilon(
+                            noisy_latents=noisy_latents,
+                            epsilon=model_pred,
+                            noise_scheduler=noise_scheduler,
+                            timesteps=timesteps,
+                        )
+                        image_first_boundary_loss_value = compute_boundary_renoise_loss(
+                            pred_clean_latents=pred_clean_latents,
+                            clean_latents=clean_latents,
+                            boundary_noise=noise.detach(),
+                            noise_scheduler=noise_scheduler,
+                            boundary_timestep=image_first_boundary_timestep,
+                            sample_weights=image_first_bridge_gate_values.detach().float(),
+                            lowfreq_only=image_first_boundary_lowfreq_only,
+                            downsample_factor=image_first_boundary_downsample_factor,
+                        )
+
                     loss = compute_diffusion_loss(
                         model_pred=model_pred,
                         target=target,
@@ -2095,6 +2319,8 @@ def main() -> None:
                         timesteps=timesteps,
                         snr_gamma=snr_gamma,
                     )
+                    if image_first_boundary_loss_weight > 0.0:
+                        loss = loss + image_first_boundary_loss_weight * image_first_boundary_loss_value
                     if latent_calibrator is not None:
                         loss = loss + float(latent_calibrator_settings.map_weight) * latent_calibrator_map_loss
                         loss = loss + (
@@ -2158,6 +2384,17 @@ def main() -> None:
                             )
                             metrics["train/image_first_shared_noise_prob"] = image_first_shared_noise_prob
                             metrics["train/image_first_bridge_fraction"] = image_first_bridge_fraction
+                            if image_first_bridge_gate_values is not None:
+                                metrics["train/image_first_bridge_gate_mean"] = (
+                                    image_first_bridge_gate_values.detach().float().mean().item()
+                                )
+                            if image_first_boundary_loss_weight > 0.0:
+                                metrics["train/image_first_boundary_loss"] = (
+                                    image_first_boundary_loss_value.detach().float().item()
+                                )
+                                metrics["train/image_first_boundary_loss_weight"] = (
+                                    image_first_boundary_loss_weight
+                                )
                             if image_first_uses_rollout_bridge:
                                 metrics["train/image_first_rollout_steps"] = image_first_rollout_steps
                         if latent_calibrator is not None:
@@ -2256,6 +2493,15 @@ def main() -> None:
                             if latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT:
                                 guidance_scale = float(validation_config.get("guidance_scale", 8.0))
                                 switch_noise_scale = float(validation_config.get("switch_noise_scale", 0.1))
+                                switch_mode = str(
+                                    validation_config.get("image_first_switch_mode", "repeat_add_noise")
+                                )
+                                renoise_noise_mode = str(
+                                    validation_config.get("image_first_renoise_noise_mode", "independent")
+                                )
+                                renoise_noise_scale = float(
+                                    validation_config.get("image_first_renoise_noise_scale", 1.0)
+                                )
                                 guidance_label = guidance_scale_label(guidance_scale)
                                 t1_ratios = config_float_list(
                                     validation_config.get("t1_ratios", [0.0, 0.25, 0.5, 0.75])
@@ -2289,6 +2535,9 @@ def main() -> None:
                                         save_video=bool(validation_config.get("save_mp4", False)),
                                         fps=int(validation_config.get("fps", 8)),
                                         switch_noise_scale=switch_noise_scale,
+                                        switch_mode=switch_mode,
+                                        renoise_noise_mode=renoise_noise_mode,
+                                        renoise_noise_scale=renoise_noise_scale,
                                     )
                                     write_status(
                                         accelerator,
@@ -2306,6 +2555,9 @@ def main() -> None:
                                                 f"validation/{t1_label}/{guidance_label}/t1_ratio": float(t1_ratio),
                                                 f"validation/{t1_label}/{guidance_label}/switch_noise_scale": (
                                                     switch_noise_scale
+                                                ),
+                                                f"validation/{t1_label}/{guidance_label}/renoise_noise_scale": (
+                                                    renoise_noise_scale
                                                 ),
                                             },
                                             step=global_step,

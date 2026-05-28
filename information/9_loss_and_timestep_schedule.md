@@ -152,9 +152,15 @@ for `first_frame_repeat`:
 
 ```yaml
 training:
-  image_first_bridge_mode: "always"  # always | snr | rollout | rollout_snr
+  image_first_bridge_mode: "always"  # always | snr | smooth_snr | rollout | rollout_snr
   image_first_bridge_snr_min: null
   image_first_bridge_snr_max: null
+  image_first_bridge_snr_full: 1.0
+  image_first_bridge_snr_zero: 5.0
+  image_first_bridge_gate: "cosine"
+  image_first_bridge_gate_domain: "log_snr"
+  image_first_boundary_loss_weight: 0.0
+  image_first_boundary_snr: null
   image_first_rollout_steps: 0
   image_first_rollout_noise_offset: 0.0
   image_first_rollout_switch_noise_scale: 0.0
@@ -163,11 +169,30 @@ training:
 `always` is the original behavior above. `snr` computes SNR from the sampled
 timestep and applies the anchor bridge only inside the configured SNR range.
 Frames outside that range use standard video noising from `clean_latents`.
-`configs/train/image_first_snr.yaml` sets `image_first_bridge_snr_max: 5.0`,
-so high-SNR/near-clean timesteps avoid the large anchor-to-video correction.
+`configs/train/image_first_snr.yaml` and
+`configs/train/image_first_snr_renoise.yaml` set
+`image_first_bridge_snr_max: 5.0`, so high-SNR/near-clean timesteps avoid the
+large anchor-to-video correction. The `snr_renoise` variant changes only the
+validation switch to pred-x0 matched re-noising.
 `configs/train/image_first_snr_ea.yaml` keeps this SNR gate and enables
 `latent_calibrator`, which is applied only to the bridged frames before the
 UNet/video adapters.
+
+`smooth_snr` replaces the hard bridge/standard switch with a continuous source
+blend. For gate value `g(t)`:
+
+```text
+source_t = g(t) * [z*1, ..., z*1] + (1 - g(t)) * z*
+z_t      = sqrt(alpha_bar_t) * source_t + sqrt(1 - alpha_bar_t) * epsilon
+```
+
+`configs/train/image_first_smooth_snr.yaml`,
+`configs/train/image_first_smooth_snr_boundary.yaml`, and
+`configs/train/image_first_smooth_snr_renoise_boundary.yaml` use a cosine gate
+in log-SNR space. The gate is 1 for SNR <= 1, smoothly decays between SNR 1 and
+SNR 5, and is 0 for SNR >= 5. When the gate reaches 0 the input and target are
+exactly the standard video DDPM path, so the model is no longer asked to
+predict the anchor-to-video correction at near-clean timesteps.
 
 `rollout` does not call `add_noise(...)` on the duplicated frame sequence.
 Instead, the first-frame anchor is noised at a slightly earlier timestep,
@@ -219,6 +244,11 @@ bridge range. Other frames use the standard DDPM epsilon target. When
 `image_first_bridge_mode: "rollout"`, the same epsilon-to-clean conversion is
 applied to rollout-produced source latents rather than analytic
 anchor-forward-noised latents.
+
+When `image_first_bridge_mode: "smooth_snr"`, the same formula is used for all
+timesteps, but the source blend makes the correction term
+`sqrt(SNR(t)) * g(t) * ([z*1, ..., z*1] - z*)`. The cosine gate drives this term
+to zero before the high-SNR region.
 
 If `latent_calibrator.enabled=true`, `train.py` computes:
 
@@ -300,6 +330,23 @@ loss =
 `configs/train/image_first_snr_ea.yaml` sets `map_weight: 0.05`,
 `map_lowfreq_only: true`, `map_downsample_factor: 4`, and
 `norm_weight: 0.001`.
+
+For `smooth_snr`, the optional boundary auxiliary loss computes `pred_x0` from
+the model's epsilon prediction, re-noises it at `image_first_boundary_snr`, and
+matches that marginal to the true video latent re-noised with the same noise:
+
+```text
+pred_x0 = (z_t - sqrt(1 - alpha_bar_t) * eps_theta) / sqrt(alpha_bar_t)
+L_boundary =
+  || Down(q(z_boundary | pred_x0))
+   - Down(sg(q(z_boundary | z*))) ||^2
+```
+
+The boundary variants set `image_first_boundary_loss_weight: 0.05`,
+`image_first_boundary_snr: 5.0`, and use low-frequency downsampling so this
+term constrains the transition marginal without turning into a full auxiliary
+video reconstruction objective. `image_first_smooth_snr.yaml` leaves the
+boundary weight at `0.0`.
 
 ## Optimization Step Accounting
 

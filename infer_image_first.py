@@ -97,6 +97,22 @@ def parse_args() -> argparse.Namespace:
         help="Frame-wise perturbation scale applied after duplicating the image latent.",
     )
     parser.add_argument(
+        "--switch_mode",
+        default=None,
+        help="Image-first switch mode: repeat_add_noise or pred_x0_renoise.",
+    )
+    parser.add_argument(
+        "--renoise_noise_mode",
+        default=None,
+        help="Frame noise mode used by pred_x0_renoise: independent or shared.",
+    )
+    parser.add_argument(
+        "--renoise_noise_scale",
+        type=float,
+        default=None,
+        help="Noise scale used by pred_x0_renoise. Defaults to validation.image_first_renoise_noise_scale.",
+    )
+    parser.add_argument(
         "--save_mp4",
         action="store_true",
         help="Also write video.mp4 when MP4 export support is available.",
@@ -356,6 +372,16 @@ def main() -> None:
         if args.switch_noise_scale is not None
         else float(validation_config.get("switch_noise_scale", 0.1))
     )
+    switch_mode = args.switch_mode or validation_config.get("image_first_switch_mode", "repeat_add_noise")
+    renoise_noise_mode = args.renoise_noise_mode or validation_config.get(
+        "image_first_renoise_noise_mode",
+        "independent",
+    )
+    renoise_noise_scale = (
+        args.renoise_noise_scale
+        if args.renoise_noise_scale is not None
+        else float(validation_config.get("image_first_renoise_noise_scale", 1.0))
+    )
     save_video = (args.save_mp4 or (args.name is not None and args.step is not None)) and not args.no_mp4
 
     frame_paths = generate_image_first_video_frames(
@@ -380,12 +406,16 @@ def main() -> None:
         save_video=save_video,
         fps=int(fps),
         switch_noise_scale=float(switch_noise_scale),
+        switch_mode=str(switch_mode),
+        renoise_noise_mode=str(renoise_noise_mode),
+        renoise_noise_scale=float(renoise_noise_scale),
     )
     print(f"Loaded checkpoint from {checkpoint_dir}")
     print(f"Saved image-first outputs to {output_dir}")
     print(
         f"Saved {len(frame_paths)} frames with t1={float(args.t1_ratio):g}, "
-        f"CFG={float(args.guidance_scale):g}, switch_noise_scale={float(switch_noise_scale):g}"
+        f"CFG={float(args.guidance_scale):g}, switch_mode={switch_mode}, "
+        f"switch_noise_scale={float(switch_noise_scale):g}"
     )
 
 

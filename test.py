@@ -26,8 +26,12 @@ from framegen.config import load_config
 from framegen.env import get_hf_cache_dir, get_hf_token, load_env_file
 from framegen.generation import guidance_scale_label, write_caption_file
 from framegen.image_first_generation import (
+    _predict_original_from_epsilon,
+    _renoise_clean_latents_for_step,
+    _sample_frame_noise,
     _scheduler_switch_noise_level,
     image_first_output_dir,
+    normalize_image_first_switch_mode,
     t1_ratio_label,
 )
 from framegen.latent_calibrator import (
@@ -53,7 +57,9 @@ from train import (
     LATENT_INIT_FIRST_FRAME_REPEAT,
     _expand_rollout_switch_level,
     compute_clean_latent_epsilon_target,
+    compute_boundary_renoise_loss,
     compute_image_first_bridge_mask,
+    compute_image_first_smooth_snr_gate,
     generate_timestep_weights,
     normalize_image_first_bridge_mode,
     normalize_image_first_noise_mode,
@@ -62,6 +68,7 @@ from train import (
     rollout_image_first_anchor_latents,
     sample_image_first_noise,
     sample_video_timesteps,
+    timestep_closest_to_snr,
     move_video_frames_to_device,
 )
 
@@ -91,9 +98,11 @@ def main() -> int:
         test_timestep_bias_weights_preserve_shared_video_timesteps,
         test_image_first_latent_repeat_and_target,
         test_image_first_snr_bridge_mask,
+        test_image_first_smooth_snr_gate_and_boundary_loss,
         test_image_first_rollout_source_shape,
         test_image_first_shared_noise_sampler,
         test_image_first_switch_noise_level_from_sigmas,
+        test_image_first_pred_x0_renoise_helpers,
         test_latent_calibrator_zero_init_and_aux_losses,
         test_infer_name_step_path_resolution,
         test_guidance_scale_label_and_caption_file,
@@ -360,6 +369,52 @@ def test_image_first_snr_bridge_mask() -> None:
         snr_max=1.0,
     )
     assert torch.equal(rollout_mask, mask)
+    assert normalize_image_first_bridge_mode("smooth_snr_bridge") == "smooth_snr"
+
+
+def test_image_first_smooth_snr_gate_and_boundary_loss() -> None:
+    class DummyScheduler:
+        alphas_cumprod = torch.tensor([0.1, 0.5, 5.0 / 6.0, 0.9], dtype=torch.float32)
+
+        def add_noise(
+            self,
+            original_samples: torch.Tensor,
+            noise: torch.Tensor,
+            timesteps: torch.Tensor,
+        ) -> torch.Tensor:
+            alpha = self.alphas_cumprod[timesteps].to(original_samples.device, original_samples.dtype)
+            while alpha.ndim < original_samples.ndim:
+                alpha = alpha.unsqueeze(-1)
+            return alpha.sqrt() * original_samples + (1.0 - alpha).sqrt() * noise
+
+    scheduler = DummyScheduler()
+    timesteps = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    gate = compute_image_first_smooth_snr_gate(
+        noise_scheduler=scheduler,
+        timesteps=timesteps,
+        snr_full=1.0,
+        snr_zero=5.0,
+        gate_mode="cosine",
+    )
+    assert torch.isclose(gate[0], torch.tensor(1.0))
+    assert torch.isclose(gate[1], torch.tensor(1.0))
+    assert torch.isclose(gate[2], torch.tensor(0.0), atol=1.0e-6)
+    assert torch.isclose(gate[3], torch.tensor(0.0), atol=1.0e-6)
+    assert int(timestep_closest_to_snr(scheduler, target_snr=5.0, device=torch.device("cpu"))) == 2
+
+    clean = torch.randn(3, 1, 4, 4)
+    noise = torch.randn_like(clean)
+    loss = compute_boundary_renoise_loss(
+        pred_clean_latents=clean,
+        clean_latents=clean,
+        boundary_noise=noise,
+        noise_scheduler=scheduler,
+        boundary_timestep=torch.tensor(2),
+        sample_weights=torch.ones(3),
+        lowfreq_only=True,
+        downsample_factor=2,
+    )
+    assert torch.equal(loss, torch.tensor(0.0))
 
 
 def test_image_first_rollout_source_shape() -> None:
@@ -468,6 +523,41 @@ def test_image_first_switch_noise_level_from_sigmas() -> None:
         ),
         torch.tensor(0.0),
     )
+
+
+def test_image_first_pred_x0_renoise_helpers() -> None:
+    class SigmaScheduler:
+        sigmas = torch.tensor([3.0, 1.0, 0.0])
+
+        class config:
+            prediction_type = "epsilon"
+
+    scheduler = SigmaScheduler()
+    timesteps = torch.tensor([999, 500])
+    clean = torch.ones(1, 1, 2, 2)
+    eps = torch.full_like(clean, 0.25)
+    sample = clean + scheduler.sigmas[1] * eps
+    pred_clean = _predict_original_from_epsilon(
+        scheduler=scheduler,
+        sample=sample,
+        noise_pred=eps,
+        timesteps=timesteps,
+        step_index=1,
+    )
+    assert torch.allclose(pred_clean, clean)
+    expanded = pred_clean.expand(3, -1, -1, -1).contiguous()
+    shared_noise = _sample_frame_noise(expanded, num_frames=3, generator=None, mode="shared")
+    assert torch.equal(shared_noise[0], shared_noise[1])
+    renoised = _renoise_clean_latents_for_step(
+        scheduler=scheduler,
+        clean_latents=expanded,
+        noise=shared_noise,
+        timesteps=timesteps,
+        step_index=1,
+        noise_scale=1.0,
+    )
+    assert torch.allclose(renoised, expanded + shared_noise)
+    assert normalize_image_first_switch_mode("matched_renoise") == "pred_x0_renoise"
 
 
 def test_latent_calibrator_zero_init_and_aux_losses() -> None:

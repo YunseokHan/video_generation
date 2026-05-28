@@ -21,6 +21,11 @@ from .video_resnet import (
     set_video_resnet_context,
 )
 
+IMAGE_FIRST_SWITCH_REPEAT_ADD_NOISE = "repeat_add_noise"
+IMAGE_FIRST_SWITCH_PRED_X0_RENOISE = "pred_x0_renoise"
+IMAGE_FIRST_RENOISE_INDEPENDENT = "independent"
+IMAGE_FIRST_RENOISE_SHARED = "shared"
+
 
 def t1_ratio_label(t1_ratio: float) -> str:
     value = float(t1_ratio)
@@ -43,6 +48,45 @@ def _set_active_states(snapshot: list[tuple[object, bool]], active: bool) -> Non
 def _restore_active_states(snapshot: list[tuple[object, bool]]) -> None:
     for block, active in snapshot:
         block.active = bool(active)
+
+
+def normalize_image_first_switch_mode(mode: str | None) -> str:
+    normalized = str(mode or IMAGE_FIRST_SWITCH_REPEAT_ADD_NOISE).lower().replace("-", "_")
+    aliases = {
+        "": IMAGE_FIRST_SWITCH_REPEAT_ADD_NOISE,
+        "repeat": IMAGE_FIRST_SWITCH_REPEAT_ADD_NOISE,
+        "repeat_add_noise": IMAGE_FIRST_SWITCH_REPEAT_ADD_NOISE,
+        "switch_noise": IMAGE_FIRST_SWITCH_REPEAT_ADD_NOISE,
+        "legacy": IMAGE_FIRST_SWITCH_REPEAT_ADD_NOISE,
+        "pred_x0": IMAGE_FIRST_SWITCH_PRED_X0_RENOISE,
+        "pred_x0_renoise": IMAGE_FIRST_SWITCH_PRED_X0_RENOISE,
+        "predict_x0_renoise": IMAGE_FIRST_SWITCH_PRED_X0_RENOISE,
+        "matched_renoise": IMAGE_FIRST_SWITCH_PRED_X0_RENOISE,
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "validation.image_first_switch_mode must be repeat_add_noise or pred_x0_renoise, "
+            f"got {mode!r}."
+        )
+    return aliases[normalized]
+
+
+def normalize_image_first_renoise_mode(mode: str | None) -> str:
+    normalized = str(mode or IMAGE_FIRST_RENOISE_INDEPENDENT).lower().replace("-", "_")
+    aliases = {
+        "": IMAGE_FIRST_RENOISE_INDEPENDENT,
+        "independent": IMAGE_FIRST_RENOISE_INDEPENDENT,
+        "frame_independent": IMAGE_FIRST_RENOISE_INDEPENDENT,
+        "shared": IMAGE_FIRST_RENOISE_SHARED,
+        "same": IMAGE_FIRST_RENOISE_SHARED,
+        "same_noise": IMAGE_FIRST_RENOISE_SHARED,
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "validation.image_first_renoise_noise_mode must be independent or shared, "
+            f"got {mode!r}."
+        )
+    return aliases[normalized]
 
 
 def _prepare_latents(
@@ -83,6 +127,112 @@ def _scheduler_switch_noise_level(
         return (1.0 - alpha_prod).clamp_min(0.0).sqrt()
 
     return torch.ones((), device=device, dtype=dtype)
+
+
+def _scheduler_sigma_for_step(
+    scheduler,
+    timesteps: torch.Tensor,
+    step_index: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    sigmas = getattr(scheduler, "sigmas", None)
+    if sigmas is None or step_index >= len(timesteps):
+        return None
+    sigma_index = min(int(step_index), int(sigmas.shape[0]) - 1)
+    return sigmas[sigma_index].to(device=device, dtype=dtype)
+
+
+def _predict_original_from_epsilon(
+    scheduler,
+    sample: torch.Tensor,
+    noise_pred: torch.Tensor,
+    timesteps: torch.Tensor,
+    step_index: int,
+) -> torch.Tensor:
+    scheduler_config = getattr(scheduler, "config", {})
+    if isinstance(scheduler_config, dict):
+        prediction_type = scheduler_config.get("prediction_type", "epsilon")
+    else:
+        prediction_type = getattr(scheduler_config, "prediction_type", "epsilon")
+    if prediction_type != "epsilon":
+        raise ValueError("pred_x0_renoise currently requires scheduler prediction_type='epsilon'.")
+    sigma = _scheduler_sigma_for_step(
+        scheduler=scheduler,
+        timesteps=timesteps,
+        step_index=step_index,
+        device=sample.device,
+        dtype=sample.dtype,
+    )
+    if sigma is not None:
+        return sample - sigma * noise_pred
+
+    alphas_cumprod = getattr(scheduler, "alphas_cumprod", None)
+    if alphas_cumprod is None:
+        raise ValueError("pred_x0_renoise requires scheduler.sigmas or scheduler.alphas_cumprod.")
+    timestep = timesteps[step_index].to(device=alphas_cumprod.device).long()
+    timestep = timestep.clamp(0, alphas_cumprod.shape[0] - 1)
+    alpha_prod = alphas_cumprod[timestep].to(device=sample.device, dtype=sample.dtype)
+    while alpha_prod.ndim < sample.ndim:
+        alpha_prod = alpha_prod.unsqueeze(-1)
+    sqrt_alpha = alpha_prod.clamp_min(1.0e-12).sqrt()
+    sqrt_one_minus_alpha = (1.0 - alpha_prod).clamp_min(1.0e-12).sqrt()
+    return (sample - sqrt_one_minus_alpha * noise_pred) / sqrt_alpha
+
+
+def _sample_frame_noise(
+    reference: torch.Tensor,
+    num_frames: int,
+    generator: torch.Generator | None,
+    mode: str,
+) -> torch.Tensor:
+    normalized = normalize_image_first_renoise_mode(mode)
+    if normalized == IMAGE_FIRST_RENOISE_SHARED:
+        noise = torch.randn(
+            (1, *reference.shape[1:]),
+            generator=generator,
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        return noise.expand(int(num_frames), -1, -1, -1).contiguous()
+    return torch.randn(
+        reference.shape,
+        generator=generator,
+        device=reference.device,
+        dtype=reference.dtype,
+    )
+
+
+def _renoise_clean_latents_for_step(
+    scheduler,
+    clean_latents: torch.Tensor,
+    noise: torch.Tensor,
+    timesteps: torch.Tensor,
+    step_index: int,
+    noise_scale: float,
+) -> torch.Tensor:
+    sigma = _scheduler_sigma_for_step(
+        scheduler=scheduler,
+        timesteps=timesteps,
+        step_index=step_index,
+        device=clean_latents.device,
+        dtype=clean_latents.dtype,
+    )
+    if sigma is not None:
+        return clean_latents + float(noise_scale) * sigma * noise
+
+    alphas_cumprod = getattr(scheduler, "alphas_cumprod", None)
+    if alphas_cumprod is None:
+        return clean_latents + float(noise_scale) * noise
+    timestep = timesteps[step_index].to(device=alphas_cumprod.device).long()
+    timestep = timestep.clamp(0, alphas_cumprod.shape[0] - 1)
+    alpha_prod = alphas_cumprod[timestep].to(device=clean_latents.device, dtype=clean_latents.dtype)
+    while alpha_prod.ndim < clean_latents.ndim:
+        alpha_prod = alpha_prod.unsqueeze(-1)
+    return (
+        alpha_prod.clamp_min(1.0e-12).sqrt() * clean_latents
+        + float(noise_scale) * (1.0 - alpha_prod).clamp_min(0.0).sqrt() * noise
+    )
 
 
 def _cfg_unet_step(
@@ -150,6 +300,9 @@ def generate_image_first_video_frames(
     save_video: bool = True,
     fps: int = 8,
     switch_noise_scale: float = 0.1,
+    switch_mode: str = IMAGE_FIRST_SWITCH_REPEAT_ADD_NOISE,
+    renoise_noise_mode: str = IMAGE_FIRST_RENOISE_INDEPENDENT,
+    renoise_noise_scale: float = 1.0,
 ) -> list[Path]:
     if num_frames <= 0:
         raise ValueError("num_frames must be positive.")
@@ -157,6 +310,10 @@ def generate_image_first_video_frames(
         raise ValueError("t1_ratio must be in [0, 1].")
     if float(switch_noise_scale) < 0.0:
         raise ValueError("switch_noise_scale must be non-negative.")
+    if float(renoise_noise_scale) < 0.0:
+        raise ValueError("renoise_noise_scale must be non-negative.")
+    switch_mode = normalize_image_first_switch_mode(switch_mode)
+    renoise_noise_mode = normalize_image_first_renoise_mode(renoise_noise_mode)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -230,23 +387,60 @@ def generate_image_first_video_frames(
             )
             latents = pipe.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
 
-        anchor_latents = latents.expand(int(num_frames), -1, -1, -1).contiguous()
-        latents = anchor_latents
-        if float(switch_noise_scale) > 0.0 and first_stage_steps < len(timesteps):
-            switch_noise_level = _scheduler_switch_noise_level(
+        if switch_mode == IMAGE_FIRST_SWITCH_PRED_X0_RENOISE and first_stage_steps < len(timesteps):
+            switch_timestep = timesteps[first_stage_steps]
+            noise_pred = _cfg_unet_step(
+                pipe=pipe,
+                latents=latents,
+                timestep=switch_timestep,
+                prompt_embeds=prompt_embeds_img,
+                pooled_prompt_embeds=pooled_prompt_embeds_img,
+                add_time_ids=add_time_ids_img,
+                guidance_scale=guidance_scale,
+                negative_prompt_embeds=negative_prompt_embeds_img,
+                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds_img,
+                negative_add_time_ids=add_time_ids_img if do_cfg else None,
+            )
+            anchor_clean_latents = _predict_original_from_epsilon(
                 scheduler=pipe.scheduler,
+                sample=latents,
+                noise_pred=noise_pred,
                 timesteps=timesteps,
                 step_index=first_stage_steps,
-                device=device,
-                dtype=latents.dtype,
             )
-            switch_noise = torch.randn(
-                latents.shape,
+            anchor_latents = anchor_clean_latents.expand(int(num_frames), -1, -1, -1).contiguous()
+            switch_noise = _sample_frame_noise(
+                reference=anchor_latents,
+                num_frames=int(num_frames),
                 generator=generator,
-                device=device,
-                dtype=latents.dtype,
+                mode=renoise_noise_mode,
             )
-            latents = latents + float(switch_noise_scale) * switch_noise_level * switch_noise
+            latents = _renoise_clean_latents_for_step(
+                scheduler=pipe.scheduler,
+                clean_latents=anchor_latents,
+                noise=switch_noise,
+                timesteps=timesteps,
+                step_index=first_stage_steps,
+                noise_scale=float(renoise_noise_scale),
+            )
+        else:
+            anchor_latents = latents.expand(int(num_frames), -1, -1, -1).contiguous()
+            latents = anchor_latents
+            if float(switch_noise_scale) > 0.0 and first_stage_steps < len(timesteps):
+                switch_noise_level = _scheduler_switch_noise_level(
+                    scheduler=pipe.scheduler,
+                    timesteps=timesteps,
+                    step_index=first_stage_steps,
+                    device=device,
+                    dtype=latents.dtype,
+                )
+                switch_noise = torch.randn(
+                    latents.shape,
+                    generator=generator,
+                    device=device,
+                    dtype=latents.dtype,
+                )
+                latents = latents + float(switch_noise_scale) * switch_noise_level * switch_noise
         _restore_active_states(unet_resnet_state)
         _restore_active_states(unet_attention_state)
 
@@ -392,6 +586,9 @@ def generate_image_first_video_frames(
         f"guidance_scale: {float(guidance_scale):g}\n"
         f"num_inference_steps: {int(num_inference_steps)}\n"
         f"switch_noise_scale: {float(switch_noise_scale):g}\n"
+        f"switch_mode: {switch_mode}\n"
+        f"renoise_noise_mode: {renoise_noise_mode}\n"
+        f"renoise_noise_scale: {float(renoise_noise_scale):g}\n"
     )
     (output_dir / "image_first_metadata.txt").write_text(metadata, encoding="utf-8")
     return output_paths

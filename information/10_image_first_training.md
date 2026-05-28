@@ -97,7 +97,7 @@ The image-first source distribution is controlled by:
 
 ```yaml
 training:
-  image_first_bridge_mode: "always"  # always | snr | rollout | rollout_snr
+  image_first_bridge_mode: "always"  # always | snr | smooth_snr | rollout | rollout_snr
 ```
 
 `always` is the original objective: every sampled timestep corrupts the
@@ -129,6 +129,22 @@ else:
 
 This avoids forcing the model to learn the large
 `sqrt(SNR(t)) * ([z*1, ..., z*1] - z*)` correction at near-clean timesteps.
+
+`smooth_snr` is used by
+`configs/train/image_first_smooth_snr_renoise_boundary.yaml`. It avoids a hard
+bridge-to-standard jump by blending the clean source:
+
+```text
+g(t)     = cosine gate in log-SNR space
+source_t = g(t) * [z*1, ..., z*1] + (1 - g(t)) * z*
+z_t      = q(z_t | source_t)
+target   = epsilon_to_reconstruct(z*)
+```
+
+The default smooth config keeps `g(t)=1` up to SNR 1, decays it to zero by SNR
+5, and adds a weak boundary loss at SNR 5. The boundary term predicts `x0`
+from the model epsilon, re-noises that estimate at the boundary, and matches it
+to the true video latent re-noised with the same noise.
 
 `image_first_snr_ea.yaml` additionally enables `latent_calibrator`, a
 zero-init temporal-conv residual mapper that is applied to bridged
@@ -186,6 +202,9 @@ validation:
   guidance_scale: 8.0
   t1_ratios: [0.0, 0.25, 0.5, 0.75]
   switch_noise_scale: 0.1
+  image_first_switch_mode: "repeat_add_noise"
+  image_first_renoise_noise_mode: "independent"
+  image_first_renoise_noise_scale: 1.0
 ```
 
 For each `t1_ratio`, the denoising schedule is split as:
@@ -202,8 +221,8 @@ Stage 1:
 
 Stage 2:
 
-- the current image latent is repeated to `[F, 4, H/8, W/8]`,
-- small frame-wise switch noise is optionally added:
+- by default, the current image latent is repeated to `[F, 4, H/8, W/8]`,
+- small frame-wise switch noise is optionally added in `repeat_add_noise` mode:
 
 ```text
 z_switch^f = z_img + switch_noise_scale * sigma_switch * eta^f
@@ -214,6 +233,22 @@ z_switch^f = z_img + switch_noise_scale * sigma_switch * eta^f
 - frame positions, pooled frame conditioning, and frame-token conditioning are
   applied,
 - the remaining scheduler steps denoise as a video.
+
+When `validation.image_first_switch_mode: "pred_x0_renoise"`, the switch first
+uses the base image UNet to estimate the clean image latent and then re-noises
+that estimate at the scheduler's switch noise level:
+
+```text
+eps_img     = base_sdxl(z_img, t_switch)
+pred_x0_img = z_img - sigma_switch * eps_img
+z_switch^f  = pred_x0_img + sigma_switch * eta^f
+```
+
+For schedulers with `alphas_cumprod`, the equivalent DDPM form is used:
+`sqrt(alpha_bar) * pred_x0_img + sqrt(1 - alpha_bar) * eta^f`.
+`image_first_renoise_noise_mode` controls whether `eta^f` is frame-independent
+or shared. The smooth-SNR boundary config uses independent re-noising to match
+its training forward process.
 
 `t1_ratio: 0.0` skips stage 1. It starts all frames from the same initial noise
 latent and uses the video model for the full denoising chain.
@@ -260,6 +295,9 @@ t1_0p25/cfg_8/
 `--switch_noise_scale` overrides `validation.switch_noise_scale`; the default
 fallback is `0.1`. Set it to `0.0` to recover exact latent duplication at the
 switch point.
+
+`--switch_mode`, `--renoise_noise_mode`, and `--renoise_noise_scale` override
+the corresponding validation fields for pred-x0 re-noising experiments.
 
 `--step last` maps to `checkpoint-last`. `--checkpoint` and `--output_dir` are
 available for copied checkpoint folders on another server. If `--config` is not
@@ -322,6 +360,18 @@ uses:
 configs/train/image_first_snr.yaml
 ```
 
+SNR-gated hybrid bridge with pred-x0 re-noise validation:
+
+```bash
+bash scripts/train_image_first_snr_renoise.sh
+```
+
+uses:
+
+```text
+configs/train/image_first_snr_renoise.yaml
+```
+
 SNR-gated hybrid bridge with latent calibrator:
 
 ```bash
@@ -356,6 +406,42 @@ uses:
 
 ```text
 configs/train/image_first_rollout_snr.yaml
+```
+
+Smooth-SNR bridge:
+
+```bash
+bash scripts/train_image_first_smooth_snr.sh
+```
+
+uses:
+
+```text
+configs/train/image_first_smooth_snr.yaml
+```
+
+Smooth-SNR bridge with boundary loss:
+
+```bash
+bash scripts/train_image_first_smooth_snr_boundary.sh
+```
+
+uses:
+
+```text
+configs/train/image_first_smooth_snr_boundary.yaml
+```
+
+Smooth-SNR bridge with pred-x0 re-noise validation and boundary loss:
+
+```bash
+bash scripts/train_image_first_smooth_snr_renoise_boundary.sh
+```
+
+uses:
+
+```text
+configs/train/image_first_smooth_snr_renoise_boundary.yaml
 ```
 
 All image-first configs keep the base SDXL image model frozen by default and

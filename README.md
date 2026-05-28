@@ -118,6 +118,12 @@ Image-first SNR-gated hybrid training:
 bash scripts/train_image_first_snr.sh
 ```
 
+Image-first SNR-gated hybrid training with pred-x0 re-noise validation:
+
+```bash
+bash scripts/train_image_first_snr_renoise.sh
+```
+
 Image-first SNR-gated training with anchor-expansion calibrator:
 
 ```bash
@@ -134,6 +140,24 @@ Image-first rollout-source training with SNR-gated fallback:
 
 ```bash
 bash scripts/train_image_first_rollout_snr.sh
+```
+
+Image-first smooth-SNR bridge:
+
+```bash
+bash scripts/train_image_first_smooth_snr.sh
+```
+
+Image-first smooth-SNR bridge with boundary loss:
+
+```bash
+bash scripts/train_image_first_smooth_snr_boundary.sh
+```
+
+Image-first smooth-SNR bridge with pred-x0 re-noise validation and boundary loss:
+
+```bash
+bash scripts/train_image_first_smooth_snr_renoise_boundary.sh
 ```
 
 `configs/train/default.yaml` enables:
@@ -157,9 +181,13 @@ changes frame-wise token embedding to learned tokens with
 `configs/train/image_first_sinusoidal.yaml`,
 `configs/train/image_first_learnable_frame_tokens.yaml`,
 `configs/train/image_first_snr.yaml`,
+`configs/train/image_first_snr_renoise.yaml`,
 `configs/train/image_first_snr_ea.yaml`,
-`configs/train/image_first_rollout.yaml`, and
-`configs/train/image_first_rollout_snr.yaml` set
+`configs/train/image_first_rollout.yaml`,
+`configs/train/image_first_rollout_snr.yaml`,
+`configs/train/image_first_smooth_snr.yaml`,
+`configs/train/image_first_smooth_snr_boundary.yaml`, and
+`configs/train/image_first_smooth_snr_renoise_boundary.yaml` set
 `training.latent_init_mode: "first_frame_repeat"`. In this mode training
 corrupts repeated first-frame latents while the objective denoises to the full
 ground-truth video latent. Validation runs CFG 8 at `t1` ratios
@@ -174,6 +202,10 @@ noise and half use frame-independent noise.
 `training.image_first_bridge_mode: "snr"` and applies the anchor bridge only
 when SNR is at or below `image_first_bridge_snr_max`; high-SNR/near-clean
 timesteps fall back to standard video DDPM noising.
+
+`configs/train/image_first_snr_renoise.yaml` keeps the same hard SNR bridge as
+`image_first_snr.yaml` but validates with
+`validation.image_first_switch_mode: "pred_x0_renoise"`.
 
 `configs/train/image_first_snr_ea.yaml` keeps the SNR-gated bridge and enables
 the zero-init temporal-conv latent calibrator. The calibrator maps
@@ -190,6 +222,22 @@ across frames.
 `training.image_first_bridge_mode: "rollout_snr"`. Timesteps inside the SNR
 range use the rollout source above; timesteps outside the range fall back to
 standard video DDPM noising and sampled epsilon targets.
+
+`configs/train/image_first_smooth_snr.yaml` uses
+`training.image_first_bridge_mode: "smooth_snr"`. It blends the anchor source
+into the true video source with a cosine gate from SNR 1 to SNR 5, without
+boundary loss or pred-x0 re-noise validation.
+
+`configs/train/image_first_smooth_snr_boundary.yaml` adds the weak boundary
+re-noising auxiliary loss at SNR 5 to the smooth-SNR bridge, while keeping the
+legacy repeat-add-noise validation switch.
+
+`configs/train/image_first_smooth_snr_renoise_boundary.yaml` uses
+`training.image_first_bridge_mode: "smooth_snr"`. It blends the anchor source
+into the true video source with a cosine gate from SNR 1 to SNR 5, adds a weak
+boundary re-noising auxiliary loss at SNR 5, and validates with
+`validation.image_first_switch_mode: "pred_x0_renoise"` so the image switch
+latent is converted to `pred_x0` and re-noised at the scheduler's switch level.
 
 `configs/accelerate/default.yaml` is the default multi-GPU launcher config and
 uses 4 GPU processes (`gpu_ids: "0,1,2,3"`).
