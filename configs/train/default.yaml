@@ -9,7 +9,7 @@ model:
 
 data:
   dataset_type: "openvid"
-  openvid_root: "/NHNHOME/WORKSPACE/26moe001_D/dataset/OpenVid-1M/OpenVid_extracted"
+  openvid_root: null
   openvid_csv: null
   openvid_sources: null
   openvid_max_videos: null

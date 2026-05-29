@@ -156,17 +156,49 @@ class VideoBasicTransformerBlock(nn.Module):
         self.video_num_frames: int | None = None
         self.video_frame_tokens: torch.Tensor | None = None
 
+        # When a use_* flag is False the corresponding sub-module is still
+        # instantiated (so state_dict layout stays compatible with checkpoints
+        # trained under the default config), but its parameters are frozen so
+        # DDP does not expect gradients for them and the trainable-param
+        # counter excludes them.
+        if not self.use_temporal_self_attention:
+            for parameter in self.temporal_norm.parameters():
+                parameter.requires_grad_(False)
+            for parameter in self.temporal_self_attn.parameters():
+                parameter.requires_grad_(False)
+        if not self.use_temporal_cross_attention:
+            for parameter in self.temporal_cross_norm.parameters():
+                parameter.requires_grad_(False)
+            for parameter in self.temporal_cross_attn.parameters():
+                parameter.requires_grad_(False)
+        if not self.use_temporal_ffn:
+            for parameter in self.temporal_ffn_norm.parameters():
+                parameter.requires_grad_(False)
+            for parameter in self.temporal_ffn_in.parameters():
+                parameter.requires_grad_(False)
+            for parameter in self.temporal_ffn_conv.parameters():
+                parameter.requires_grad_(False)
+            for parameter in self.temporal_ffn_out.parameters():
+                parameter.requires_grad_(False)
+            self.temporal_ffn_gamma.requires_grad_(False)
+
     @property
     def adapter_parameters(self) -> Iterator[nn.Parameter]:
-        yield from self.temporal_norm.parameters()
-        yield from self.temporal_self_attn.parameters()
-        yield from self.temporal_cross_norm.parameters()
-        yield from self.temporal_cross_attn.parameters()
-        yield from self.temporal_ffn_norm.parameters()
-        yield from self.temporal_ffn_in.parameters()
-        yield from self.temporal_ffn_conv.parameters()
-        yield from self.temporal_ffn_out.parameters()
-        yield self.temporal_ffn_gamma
+        # Only yield parameters from sub-modules whose use_* flag is on. This
+        # keeps disabled sub-modules out of the train=True grad-enablement path
+        # so DDP does not see them as trainable parameters.
+        if self.use_temporal_self_attention:
+            yield from self.temporal_norm.parameters()
+            yield from self.temporal_self_attn.parameters()
+        if self.use_temporal_cross_attention:
+            yield from self.temporal_cross_norm.parameters()
+            yield from self.temporal_cross_attn.parameters()
+        if self.use_temporal_ffn:
+            yield from self.temporal_ffn_norm.parameters()
+            yield from self.temporal_ffn_in.parameters()
+            yield from self.temporal_ffn_conv.parameters()
+            yield from self.temporal_ffn_out.parameters()
+            yield self.temporal_ffn_gamma
 
     def set_chunk_feed_forward(self, chunk_size: int | None, dim: int = 0) -> None:
         self._chunk_size = chunk_size

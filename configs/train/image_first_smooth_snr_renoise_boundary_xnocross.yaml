@@ -1,3 +1,20 @@
+# Experiment E1: smooth_snr_renoise_boundary + temporal cross-attention removed.
+#
+# Hypothesis: under token_embedding_mode=add_to_text the per-block temporal
+# cross-attn (K/V = sinusoidal non-trainable frame tokens) is redundant with
+# (a) frame embedding already added to the pooled text path and
+# (b) temporal self-attn over the frame axis.
+#
+# Result if hypothesis holds: ~46% reduction of the temporal-adapter trainable
+# parameter budget at near-zero quality cost.
+#
+# This is a CONFIG-ONLY ablation. The toggle already exists at
+# framegen/video_attention.py:VideoAttentionAdapterConfig.use_temporal_cross_attention.
+# Every other field is identical to image_first_smooth_snr_renoise_boundary.yaml
+# so that wandb diffs are value-only.
+#
+# Companion: information/claude-codex-discussion.md §5 Experiment E1.
+
 model:
   pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
   pretrained_vae_model_name_or_path: null
@@ -107,7 +124,7 @@ video_adapters:
     active: true
     train: true
     use_temporal_self_attention: true
-    use_temporal_cross_attention: true
+    use_temporal_cross_attention: false        # <-- E1 ablation: removed
     use_temporal_ffn: true
     temporal_ffn_rank: 0
     temporal_ffn_kernel_size: 3
@@ -115,8 +132,8 @@ video_adapters:
     include_prompt_tokens: true
 
 training:
-  output_dir: "outputs/image-first-rollout"
-  train_batch_size: 2
+  output_dir: "outputs/image-first-smooth-snr-renoise-boundary-xnocross"
+  train_batch_size: 4
   gradient_accumulation_steps: 4
   learning_rate: 1.0e-5
   scale_lr: false
@@ -138,20 +155,20 @@ training:
   latent_init_mode: "first_frame_repeat"
   image_first_noise_mode: "independent"
   image_first_shared_noise_prob: 0.5
-  image_first_bridge_mode: "rollout"
+  image_first_bridge_mode: "smooth_snr"
   image_first_bridge_snr_min: null
-  image_first_bridge_snr_max: null
+  image_first_bridge_snr_max: 5.0
   image_first_bridge_snr_full: 1.0
   image_first_bridge_snr_zero: 5.0
   image_first_bridge_gate: "cosine"
   image_first_bridge_gate_domain: "log_snr"
-  image_first_boundary_loss_weight: 0.0
-  image_first_boundary_snr: null
+  image_first_boundary_loss_weight: 0.05
+  image_first_boundary_snr: 5.0
   image_first_boundary_lowfreq_only: true
   image_first_boundary_downsample_factor: 4
-  image_first_rollout_steps: 4
+  image_first_rollout_steps: 0
   image_first_rollout_noise_offset: 0.0
-  image_first_rollout_switch_noise_scale: 0.1
+  image_first_rollout_switch_noise_scale: 0.0
   noise_offset: 0.0
   snr_gamma: null
   timestep_bias_strategy: "none"
@@ -172,11 +189,11 @@ logging:
   report_to: "wandb"
   project: "sdxl-frame-generator"
   entity: null
-  run_name: "image-first-rollout"
+  run_name: "image-first-smooth-snr-renoise-boundary-xnocross"
   group: null
   job_type: "train"
-  tags: ["sdxl", "frame-generator", "image-first", "rollout-source", "sinusoidal-frame-tokens"]
-  notes: null
+  tags: ["sdxl", "frame-generator", "image-first", "smooth-snr", "pred-x0-renoise", "boundary-loss", "sinusoidal-frame-tokens", "ablation-no-cross-attn", "experiment-E1"]
+  notes: "E1: temporal cross-attn removed (use_temporal_cross_attention=false). Tests whether per-block temporal cross-attn with sinusoidal frame tokens is redundant when frame embedding is already added to the pooled prompt path via add_to_text mode."
   log_validation_media: true
   log_training_caption_inference: false
   training_caption_inference_steps: 100
@@ -212,7 +229,7 @@ validation:
   guidance_scales: [1.0, 8.0]
   t1_ratios: [0.0, 0.25, 0.5, 0.75]
   switch_noise_scale: 0.1
-  image_first_switch_mode: "repeat_add_noise"
+  image_first_switch_mode: "pred_x0_renoise"
   image_first_renoise_noise_mode: "independent"
   image_first_renoise_noise_scale: 1.0
   fps: 8

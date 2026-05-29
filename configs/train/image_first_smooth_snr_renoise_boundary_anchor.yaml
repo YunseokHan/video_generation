@@ -1,3 +1,33 @@
+# Experiment E2: persistent anchor conditioning (Agenda A1 v1) + mid+up
+# placement restriction (Agenda A3.2), continuation fine-tune from E1.
+#
+# Hypothesis: gated, spatial-aligned anchor K/V tokens in temporal cross-attn
+# at mid + up SDXL blocks improve first-frame identity preservation and the
+# stage-1 -> stage-2 handoff. Mid+up restriction prevents the anchor branch
+# from undoing E1's cross-attn-removal saving. Target trainable budget < 0.5B.
+#
+# ==========================================================================
+# IMPORTANT: this config IS NOT YET RUNNABLE. It references new fields that
+# require code changes listed in information/claude-codex-discussion.md
+# §5 Experiment E2 (B-2, B-3, B-4):
+#
+#   * video_adapters.attention.placement                  -> requires block_filter
+#                                                            in framegen/video_attention.py
+#                                                            inject path
+#   * video_adapters.attention.anchor_conditioning.*      -> requires new anchor-attn
+#                                                            branch inside
+#                                                            VideoBasicTransformerBlock
+#                                                            + projector + gate
+#   * train.py wiring of anchor_clean = z*_1
+#   * framegen/image_first_generation.py wiring of
+#     anchor_clean = pred_x0 at switch
+#
+# Until those code paths exist, this config would silently degrade to E1 with
+# a resume from E1's checkpoint, which is NOT what you want.
+# ==========================================================================
+#
+# Companion: information/claude-codex-discussion.md §5 Experiment E2.
+
 model:
   pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
   pretrained_vae_model_name_or_path: null
@@ -98,6 +128,7 @@ video_adapters:
     enabled: true
     active: true
     train: true
+    placement: "mid_up"                        # NEW (A3.2). down|mid|up combinations; default "all"
     frame_embedding_dim: 2048
     use_temporal_conv1: true
     use_temporal_conv2: true
@@ -106,24 +137,34 @@ video_adapters:
     enabled: true
     active: true
     train: true
+    placement: "mid_up"                        # NEW (A3.2)
     use_temporal_self_attention: true
-    use_temporal_cross_attention: true
+    use_temporal_cross_attention: false        # inherited from E1
     use_temporal_ffn: true
     temporal_ffn_rank: 0
     temporal_ffn_kernel_size: 3
     temporal_ffn_gamma_init: 0.0
     include_prompt_tokens: true
+    anchor_conditioning:                       # NEW (A1 v1)
+      enabled: true
+      mode: "spatial"                          # spatial | global
+      projector_hidden: 128
+      projector_share_by_resolution: true
+      gate_init: 0.0
+      gate_per_channel: false
+      train_anchor_attn: true
+      train_projector: true
 
 training:
-  output_dir: "outputs/image-first-rollout"
-  train_batch_size: 2
+  output_dir: "outputs/image-first-smooth-snr-renoise-boundary-anchor"
+  train_batch_size: 4
   gradient_accumulation_steps: 4
   learning_rate: 1.0e-5
   scale_lr: false
   lr_scheduler: "constant"
-  lr_warmup_steps: 500
+  lr_warmup_steps: 0                           # continuation fine-tune, no fresh warmup
   num_train_epochs: 100
-  max_train_steps: 15000
+  max_train_steps: 18000                       # 3000 continuation steps on top of E1's 15000
   mixed_precision: "bf16"
   train_temporal_embedding: true
   train_unet: false
@@ -138,20 +179,20 @@ training:
   latent_init_mode: "first_frame_repeat"
   image_first_noise_mode: "independent"
   image_first_shared_noise_prob: 0.5
-  image_first_bridge_mode: "rollout"
+  image_first_bridge_mode: "smooth_snr"
   image_first_bridge_snr_min: null
-  image_first_bridge_snr_max: null
+  image_first_bridge_snr_max: 5.0
   image_first_bridge_snr_full: 1.0
   image_first_bridge_snr_zero: 5.0
   image_first_bridge_gate: "cosine"
   image_first_bridge_gate_domain: "log_snr"
-  image_first_boundary_loss_weight: 0.0
-  image_first_boundary_snr: null
+  image_first_boundary_loss_weight: 0.05
+  image_first_boundary_snr: 5.0
   image_first_boundary_lowfreq_only: true
   image_first_boundary_downsample_factor: 4
-  image_first_rollout_steps: 4
+  image_first_rollout_steps: 0
   image_first_rollout_noise_offset: 0.0
-  image_first_rollout_switch_noise_scale: 0.1
+  image_first_rollout_switch_noise_scale: 0.0
   noise_offset: 0.0
   snr_gamma: null
   timestep_bias_strategy: "none"
@@ -162,8 +203,8 @@ training:
   proportion_empty_prompts: 0.0
   checkpointing_steps: 500
   checkpoints_total_limit: null
-  resume_from_checkpoint: null
-  validation_steps: 1000
+  resume_from_checkpoint: "outputs/image-first-smooth-snr-renoise-boundary-xnocross/checkpoint-last"
+  validation_steps: 500                        # tighter cadence during the 3k continuation
   logging_steps: 10
   logging_dir: "logs"
   seed: 42
@@ -172,11 +213,11 @@ logging:
   report_to: "wandb"
   project: "sdxl-frame-generator"
   entity: null
-  run_name: "image-first-rollout"
+  run_name: "image-first-smooth-snr-renoise-boundary-anchor"
   group: null
   job_type: "train"
-  tags: ["sdxl", "frame-generator", "image-first", "rollout-source", "sinusoidal-frame-tokens"]
-  notes: null
+  tags: ["sdxl", "frame-generator", "image-first", "smooth-snr", "pred-x0-renoise", "boundary-loss", "sinusoidal-frame-tokens", "ablation-no-cross-attn", "anchor-conditioning-v1", "placement-mid-up", "experiment-E2", "continuation-finetune"]
+  notes: "E2: A1 v1 persistent anchor conditioning (spatial-aligned K/V at mid+up blocks) + A3.2 mid+up placement restriction. Continuation fine-tune from E1's checkpoint-last. anchor_conditioning.gate_init=0 so step-0 output matches E1; gate opens during fine-tune."
   log_validation_media: true
   log_training_caption_inference: false
   training_caption_inference_steps: 100
@@ -212,7 +253,7 @@ validation:
   guidance_scales: [1.0, 8.0]
   t1_ratios: [0.0, 0.25, 0.5, 0.75]
   switch_noise_scale: 0.1
-  image_first_switch_mode: "repeat_add_noise"
+  image_first_switch_mode: "pred_x0_renoise"
   image_first_renoise_noise_mode: "independent"
   image_first_renoise_noise_scale: 1.0
   fps: 8

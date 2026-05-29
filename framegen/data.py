@@ -11,6 +11,8 @@ import torch
 from PIL import Image, ImageOps
 from torch.utils.data import Dataset
 
+from framegen.env import get_openvid_csv, get_openvid_root
+
 try:
     import numpy as np
 except ImportError:  # pragma: no cover - torch environments generally include numpy.
@@ -613,8 +615,8 @@ def build_dataset(config: dict[str, Any]) -> Dataset:
         )
     if dataset_type == "openvid":
         return OpenVidVideoDataset(
-            root=data_config.get("openvid_root", DEFAULT_OPENVID_ROOT),
-            csv_path=data_config.get("openvid_csv"),
+            root=get_openvid_root(data_config.get("openvid_root")) or DEFAULT_OPENVID_ROOT,
+            csv_path=get_openvid_csv(data_config.get("openvid_csv")),
             num_frames_per_video=data_config["num_frames_per_video"],
             resolution=model_config["resolution"],
             frame_sampling=data_config.get("frame_sampling", "uniform"),

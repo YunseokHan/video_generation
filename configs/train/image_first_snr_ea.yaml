@@ -9,7 +9,7 @@ model:
 
 data:
   dataset_type: "openvid"
-  openvid_root: "/home/work/data/yunseok/video_generation/datasets/OpenVid_extracted"
+  openvid_root: null
   openvid_csv: null
   openvid_sources: null
   openvid_max_videos: null

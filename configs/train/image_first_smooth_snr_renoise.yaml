@@ -115,8 +115,8 @@ video_adapters:
     include_prompt_tokens: true
 
 training:
-  output_dir: "outputs/image-first-rollout"
-  train_batch_size: 2
+  output_dir: "outputs/image-first-smooth-snr-renoise"
+  train_batch_size: 4
   gradient_accumulation_steps: 4
   learning_rate: 1.0e-5
   scale_lr: false
@@ -138,20 +138,20 @@ training:
   latent_init_mode: "first_frame_repeat"
   image_first_noise_mode: "independent"
   image_first_shared_noise_prob: 0.5
-  image_first_bridge_mode: "rollout"
+  image_first_bridge_mode: "smooth_snr"
   image_first_bridge_snr_min: null
-  image_first_bridge_snr_max: null
+  image_first_bridge_snr_max: 5.0
   image_first_bridge_snr_full: 1.0
   image_first_bridge_snr_zero: 5.0
   image_first_bridge_gate: "cosine"
   image_first_bridge_gate_domain: "log_snr"
   image_first_boundary_loss_weight: 0.0
-  image_first_boundary_snr: null
+  image_first_boundary_snr: 5.0
   image_first_boundary_lowfreq_only: true
   image_first_boundary_downsample_factor: 4
-  image_first_rollout_steps: 4
+  image_first_rollout_steps: 0
   image_first_rollout_noise_offset: 0.0
-  image_first_rollout_switch_noise_scale: 0.1
+  image_first_rollout_switch_noise_scale: 0.0
   noise_offset: 0.0
   snr_gamma: null
   timestep_bias_strategy: "none"
@@ -172,10 +172,10 @@ logging:
   report_to: "wandb"
   project: "sdxl-frame-generator"
   entity: null
-  run_name: "image-first-rollout"
+  run_name: "image-first-smooth-snr-renoise"
   group: null
   job_type: "train"
-  tags: ["sdxl", "frame-generator", "image-first", "rollout-source", "sinusoidal-frame-tokens"]
+  tags: ["sdxl", "frame-generator", "image-first", "smooth-snr", "pred-x0-renoise", "no-boundary-loss", "sinusoidal-frame-tokens", "ablation-2x2"]
   notes: null
   log_validation_media: true
   log_training_caption_inference: false
@@ -212,7 +212,7 @@ validation:
   guidance_scales: [1.0, 8.0]
   t1_ratios: [0.0, 0.25, 0.5, 0.75]
   switch_noise_scale: 0.1
-  image_first_switch_mode: "repeat_add_noise"
+  image_first_switch_mode: "pred_x0_renoise"
   image_first_renoise_noise_mode: "independent"
   image_first_renoise_noise_scale: 1.0
   fps: 8

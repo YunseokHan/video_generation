@@ -2,6 +2,9 @@
 .env
 .env.*
 !.env.example
+.claude/
+.empty/
+CLAUDE.md
 
 # Python cache/build artifacts.
 __pycache__/

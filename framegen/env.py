@@ -89,6 +89,37 @@ def get_hf_token(model_config: dict[str, Any] | None = None) -> str | None:
     )
 
 
+def get_openvid_root(config_value: str | None = None) -> str | None:
+    """Resolve the OpenVid dataset root.
+
+    Precedence: ``OPENVID_ROOT`` env var > explicit ``config_value`` > None.
+
+    The env var is deliberately allowed to override a committed config value so
+    the same configs run on different servers by editing only ``.env``. Callers
+    should fall back to their own hardcoded default when this returns None.
+    """
+    env_root = _get_nonempty_env("OPENVID_ROOT")
+    if env_root:
+        return env_root
+    if config_value:
+        return str(config_value)
+    return None
+
+
+def get_openvid_csv(config_value: str | None = None) -> str | None:
+    """Resolve the OpenVid CSV path.
+
+    Precedence: ``OPENVID_CSV`` env var > explicit ``config_value`` > None.
+    When None, ``OpenVidVideoDataset`` defaults to ``<root>/OpenVid.csv``.
+    """
+    env_csv = _get_nonempty_env("OPENVID_CSV")
+    if env_csv:
+        return env_csv
+    if config_value:
+        return str(config_value)
+    return None
+
+
 def _hf_cache_to_hub_cache(hf_cache: str | None) -> str | None:
     if not hf_cache:
         return None

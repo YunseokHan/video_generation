@@ -160,6 +160,31 @@ Image-first smooth-SNR bridge with pred-x0 re-noise validation and boundary loss
 bash scripts/train_image_first_smooth_snr_renoise_boundary.sh
 ```
 
+Experiment E1 — same bridge, temporal cross-attn removed
+(see `information/claude-codex-discussion.md` §5):
+
+```bash
+bash scripts/train_image_first_smooth_snr_renoise_boundary_xnocross.sh
+```
+
+Experiment E2 — persistent anchor conditioning v1 + mid+up placement, as a
+continuation fine-tune from E1. **Requires the code changes listed in the
+E2 config header before the run is meaningful**:
+
+```bash
+bash scripts/train_image_first_smooth_snr_renoise_boundary_anchor.sh
+```
+
+VAE temporal coherence diagnostic (A2). Read-only measurement; runs in
+~25 min for 100 clips and writes `metrics.json`, `per_clip.json`, and a
+contact-sheet folder under `outputs/diagnostics/vae_temporal/`. See
+`information/12_vae_temporal_diagnostic.md`:
+
+```bash
+bash scripts/diagnostic_vae_temporal.sh --smoke         # 32 clips, ~5 min
+bash scripts/diagnostic_vae_temporal.sh --num_clips 100 # recommended
+```
+
 `configs/train/default.yaml` enables:
 
 - UNet convolutional/Resnet video adapters
@@ -282,6 +307,20 @@ WANDB_API_KEY=
 WANDB_ENTITY=
 WANDB_MODE=online
 ```
+
+The OpenVid dataset location is also read from `.env`, so the same configs run
+on any server by editing only this file:
+
+```text
+OPENVID_ROOT=/abs/path/to/OpenVid_extracted
+OPENVID_CSV=          # optional; defaults to <OPENVID_ROOT>/OpenVid.csv
+```
+
+Resolution precedence is `OPENVID_ROOT` env var > a config's `data.openvid_root`
+> the hardcoded default. All `configs/train/*.yaml` ship with
+`openvid_root: null` so the env var is the single source of truth. Pass
+`--openvid_root` to `diagnostics/vae_temporal_diagnostic.py` to override per
+run (CLI > env).
 
 When `logging.report_to: "wandb"` is enabled, training metrics such as loss,
 learning rate, epoch progress, seen frames, parameter counts, checkpoint

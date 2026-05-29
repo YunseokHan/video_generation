@@ -373,6 +373,17 @@ def repeat_first_frame_latents(latents: torch.Tensor, batch_size: int, num_frame
     return anchor.reshape_as(latents)
 
 
+def _scalar(value) -> float:
+    """Convert a python float or a (possibly GPU) tensor to a python float.
+
+    Used only in logging paths so the per-micro-step hot loop can keep these
+    diagnostics as device tensors and avoid a CUDA sync on every step.
+    """
+    if torch.is_tensor(value):
+        return float(value.detach().item())
+    return float(value)
+
+
 def sample_image_first_noise(
     reference: torch.Tensor,
     batch_size: int,
@@ -380,7 +391,7 @@ def sample_image_first_noise(
     noise_mode: str,
     shared_noise_prob: float,
     noise_offset: float,
-) -> tuple[torch.Tensor, float]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     if reference.shape[0] != int(batch_size) * int(num_frames):
         raise ValueError(
             "reference must be flattened [B*F, C, H, W], got "
@@ -426,7 +437,7 @@ def sample_image_first_noise(
         offset_noise = torch.where(mask, shared_offset, independent_offset)
         noise = noise + float(noise_offset) * offset_noise
 
-    return noise.reshape_as(reference), mask.float().mean().item()
+    return noise.reshape_as(reference), mask.float().mean()
 
 
 def _optional_float(value) -> float | None:
@@ -2008,7 +2019,7 @@ def main() -> None:
                                     snr_min=image_first_bridge_snr_min,
                                     snr_max=image_first_bridge_snr_max,
                                 )
-                                image_first_bridge_fraction = bridge_mask.float().mean().item()
+                                image_first_bridge_fraction = bridge_mask.float().mean()
                                 standard_noise = torch.randn_like(clean_latents)
                                 standard_noise = add_noise_offset(
                                     standard_noise,
@@ -2045,7 +2056,7 @@ def main() -> None:
                                 snr_min=image_first_bridge_snr_min,
                                 snr_max=image_first_bridge_snr_max,
                             )
-                            image_first_bridge_fraction = bridge_mask.float().mean().item()
+                            image_first_bridge_fraction = bridge_mask.float().mean()
                             if image_first_uses_smooth_snr_bridge:
                                 if image_first_bridge_snr_full is None or image_first_bridge_snr_zero is None:
                                     raise RuntimeError("smooth_snr bridge thresholds were not initialized.")
@@ -2058,7 +2069,7 @@ def main() -> None:
                                     domain=image_first_bridge_gate_domain,
                                 ).to(device=clean_latents.device, dtype=clean_latents.dtype)
                                 image_first_bridge_fraction = (
-                                    image_first_bridge_gate_values.detach().float().mean().item()
+                                    image_first_bridge_gate_values.detach().float().mean()
                                 )
                                 gate = image_first_bridge_gate_values
                                 while gate.ndim < clean_latents.ndim:
@@ -2168,12 +2179,12 @@ def main() -> None:
                                     else None
                                 ),
                                 "image_first_shared_noise_fraction": (
-                                    image_first_shared_noise_fraction
+                                    _scalar(image_first_shared_noise_fraction)
                                     if latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT
                                     else None
                                 ),
                                 "image_first_bridge_fraction": (
-                                    image_first_bridge_fraction
+                                    _scalar(image_first_bridge_fraction)
                                     if latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT
                                     else None
                                 ),
@@ -2380,10 +2391,10 @@ def main() -> None:
                         }
                         if latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT:
                             metrics["train/image_first_shared_noise_fraction"] = (
-                                image_first_shared_noise_fraction
+                                _scalar(image_first_shared_noise_fraction)
                             )
                             metrics["train/image_first_shared_noise_prob"] = image_first_shared_noise_prob
-                            metrics["train/image_first_bridge_fraction"] = image_first_bridge_fraction
+                            metrics["train/image_first_bridge_fraction"] = _scalar(image_first_bridge_fraction)
                             if image_first_bridge_gate_values is not None:
                                 metrics["train/image_first_bridge_gate_mean"] = (
                                     image_first_bridge_gate_values.detach().float().mean().item()
