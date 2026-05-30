@@ -1150,6 +1150,16 @@ Configs (warm-start E1, 3k steps, mid+up placement, cross-attn off):
   z*_1 bridge source with the repeated rollout pred_x0.
 Config: `image_first_smooth_snr_renoise_boundary_rollout.yaml`.
 
+**E4 is an INDEPENDENT fresh 15k run, not a warm-start (revised 2026-05-30).**
+Because rollout_pred_x0 changes the training forward process, a 3k warm-start
+from E1 (trained on clean-anchor smooth_snr) may under-adapt to the new source.
+So E4 matches the eval **baseline** (`image-first-smooth-snr-renoise-boundary`)
+exactly — cross-attn ON, placement all, full 15k, warmup 500,
+`init_from_checkpoint: null` — and the clean comparison is **E4 vs baseline**
+(isolates the rollout-source effect). E2/E3 stay 3k warm-start continuations
+from E1 (anchor/calibrator are zero-init identity, so warm-start fits there;
+compare them to E1).
+
 ### Schema + safety
 - Added `latent_calibrator.conditioning.{use_bridge_gate,use_log_snr}` and
   `training.{image_first_smooth_anchor_source,image_first_rollout_source_timestep,

@@ -1,7 +1,13 @@
 # Experiment E4: smooth_snr bridge with rollout pred_x0 source (no anchor/calib).
 # Bridge source = base-SDXL rollout pred_x0 of the anchor image (x0-like, matches
-# inference stage-1) instead of clean z*_1. Warm-start from E1.
-# Companion: information/claude-codex-discussion.md §3 U3 (E4) + §5.
+# inference stage-1) instead of clean z*_1.
+#
+# INDEPENDENT fresh 15k run (NOT a warm-start): because rollout_pred_x0 changes the
+# training forward process, a 3k warm-start from E1 may under-adapt. This config
+# matches the eval baseline (image-first-smooth-snr-renoise-boundary) exactly —
+# cross-attn ON, placement all, full 15k, warmup 500 — so that E4 vs baseline
+# isolates the rollout-source effect alone.
+# Companion: information/claude-codex-discussion.md §3 U3 (E4) + §5/§9.
 
 model:
   pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
@@ -105,7 +111,7 @@ video_adapters:
     enabled: true
     active: true
     train: true
-    placement: "mid_up"                        # NEW (A3.2). down|mid|up combinations; default "all"
+    placement: "all"
     frame_embedding_dim: 2048
     use_temporal_conv1: true
     use_temporal_conv2: true
@@ -114,9 +120,9 @@ video_adapters:
     enabled: true
     active: true
     train: true
-    placement: "mid_up"                        # NEW (A3.2)
+    placement: "all"
     use_temporal_self_attention: true
-    use_temporal_cross_attention: false        # inherited from E1
+    use_temporal_cross_attention: true
     use_temporal_ffn: true
     temporal_ffn_rank: 0
     temporal_ffn_kernel_size: 3
@@ -139,9 +145,9 @@ training:
   learning_rate: 1.0e-5
   scale_lr: false
   lr_scheduler: "constant"
-  lr_warmup_steps: 0                           # continuation fine-tune, no fresh warmup
+  lr_warmup_steps: 500
   num_train_epochs: 100
-  max_train_steps: 3000                        # warm-start resets the step counter to 0, so this is
+  max_train_steps: 15000
                                                # the number of NEW steps E2 trains (not 15000+3000).
                                                # init_from_checkpoint carries only E1's adapter WEIGHTS;
                                                # optimizer/scheduler/step counter all start fresh.
@@ -191,7 +197,7 @@ training:
                                                # so accelerator.load_state would fail. Use weights-only
                                                # warm start instead (matching temporal weights load
                                                # strict=False; anchor stays fresh at gate=0).
-  init_from_checkpoint: "outputs/image-first-smooth-snr-renoise-boundary-xnocross/checkpoint-last"
+  init_from_checkpoint: null
   validation_steps: 500                        # tighter cadence during the 3k continuation
   logging_steps: 10
   logging_dir: "logs"
