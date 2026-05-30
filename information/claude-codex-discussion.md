@@ -837,6 +837,93 @@ we need to add global pooled anchor tokens too. Either is a v2 follow-up.
 3k continuation steps on 4 GPUs ≈ 6–8 hours from E1's checkpoint, vs a
 full retrain.
 
+#### E2 implementation — 2026-05-29
+
+Implemented all four code paths. Files:
+
+- `framegen/video_attention.py`:
+  - `VideoAttentionAdapterConfig` gained `placement` and an
+    `anchor_conditioning.*` group (`enabled`, `mode`, `latent_channels`,
+    `projector_hidden`, `gate_init`, `gate_per_channel`).
+  - `resolve_unet_placement_sections()` + `_placement_roots()` restrict
+    injection to top-level UNet sections (`down`/`mid`/`up`). Default `"all"`
+    keeps prior whole-UNet behaviour (backward compatible).
+  - `VideoBasicTransformerBlock` gained a gated, spatial-aligned anchor K/V
+    branch: `anchor_proj_in` (Conv2d 4→hidden 1×1) → SiLU → `anchor_proj_out`
+    (Conv2d hidden→dim 1×1), an `anchor_attn` (Attention, query=temporal
+    stream, K/V=anchor token per spatial site), `anchor_norm`, and a
+    zero-init `anchor_gate`. Forward inserts
+    `hidden = hidden + gate * anchor_attn(...)` right after temporal
+    self-attn. The anchor latent is bilinearly resized to each block's
+    grid, projected, and reshaped to one K/V token per site; CFG batch
+    mismatch is handled by `repeat_interleave`.
+  - `set_video_attention_context` / `clear_video_context` /
+    `sync_video_attention_adapter_device_dtype` / state-dict filter all
+    extended for the anchor params.
+- `framegen/video_resnet.py`: `VideoResnetAdapterConfig.placement` + the same
+  placement filter (imports the helpers from `video_attention`).
+- `train.py`:
+  - anchor = `clean_latents[:, 0]` (z*_1) passed to the attention context
+    when `anchor_conditioning.enabled` and `first_frame_repeat`.
+  - `training.init_from_checkpoint`: a **weights-only warm start** distinct
+    from `resume_from_checkpoint`. Because E2's architecture (anchor branch
+    + mid+up placement) differs from E1's, `accelerator.load_state` (full
+    state, identical-architecture) cannot be used. Instead the adapter `.pt`
+    files are loaded with `strict=False`: matching temporal weights load,
+    E1's extra down-block / cross-attn keys are ignored, and E2's fresh
+    anchor params stay at init. Fresh optimizer state.
+- `framegen/image_first_generation.py`: anchor = stage-1 `pred_x0` at the
+  switch (`pred_x0_renoise` mode) or the stage-1 latent (`repeat_add_noise`),
+  passed to the video-stage attention context.
+- `configs/train/image_first_smooth_snr_renoise_boundary_anchor.yaml`:
+  `resume_from_checkpoint: null` + `init_from_checkpoint:
+  outputs/...-xnocross/checkpoint-last`.
+
+**Bug caught by the gate-gradient test (important).** The first cut also
+zero-initialised the `anchor_attn` output projection *in addition to* the
+zero gate. That is a **dead-branch deadlock**: with both zero, the gate's
+gradient `∂L/∂gate = upstream · anchor_out = upstream · 0 = 0`, so the gate
+never moves and the branch can never open. Fix: keep only the zero gate for
+the identity guarantee and leave `anchor_attn` normally initialised, so
+`anchor_out ≠ 0` and the gate receives gradient from step 1 (matches codex's
+A1 turn-3 advice: "keep the anchor projector normally initialised so the
+gate can receive gradients immediately"). Verified: gate=0 → exact identity;
+gate grad at init ≈ 4.3e-3 (nonzero).
+
+**Backward compatibility (important — E1 + the 4 parallel runs share this
+code).** Already-running processes are unaffected (Python does not re-read
+source mid-run). Even on a restart, configs without `placement` /
+`anchor_conditioning` resolve to `placement="all"` and `anchor_enabled=False`,
+which reproduce the exact prior module tree and forward path. Verified by
+unit tests + the core `test.py` suite.
+
+**Config schema parity.** `test.py::test_train_configs_share_same_schema`
+requires every `configs/train/*.yaml` to share an identical key structure.
+The new keys (`training.init_from_checkpoint`,
+`video_adapters.{resnet,attention}.placement`,
+`video_adapters.attention.anchor_conditioning.*` with 8 sub-keys) were added
+to all 16 configs with inert defaults (`placement: "all"`,
+`anchor_conditioning.enabled: false`, `init_from_checkpoint: null`), matching
+the repo's existing "same schema, value-only diffs" convention.
+
+**Warm-start semantics (answer to "does it continue from E1?").** It is a
+*weights-only warm start*, NOT a full-state resume:
+
+- Carried over from E1's `checkpoint-last`: adapter **weights** (temporal
+  self-attn, FFN, resnet adapters, temporal_mlp), loaded strict=False.
+- NOT carried over: the **step counter** (`global_step` starts at 0, not
+  15000), optimizer (Adam moments), LR scheduler, RNG, dataloader position —
+  all fresh.
+- The anchor branch starts at `gate=0`, so at step 0 E2's model output ≈
+  E1's final model; the gate then opens during E2's training.
+- Therefore `max_train_steps` is the number of NEW steps E2 trains. It was
+  corrected from 18000 → **3000** (the intended continuation length) because
+  the counter no longer starts at 15000.
+- **Crash recovery**: to resume E2 itself after an interruption, relaunch
+  with `resume_from_checkpoint: "latest"`. That skips the warm-start (resume
+  takes precedence) and `accelerator.load_state` loads E2's *own*
+  checkpoint, whose architecture now matches.
+
 ---
 
 ### Experiments **NOT** queued this cycle (rationale)
@@ -953,3 +1040,130 @@ When a new round of discussion happens or an earlier conclusion is revised:
 
 Do **not** delete prior content — keep the history readable. Strikethrough
 or "superseded by" notes are preferred over rewrites.
+
+## 8. Feasibility analysis — budget vs comparable T2I→T2V works (2026-05-29)
+
+Codex consulted (2 turns, web-grounded) on whether the current
+train+eval budget supports **confident ablation decisions** (not SOTA).
+
+### Current budget (measured)
+- Data: 129,337 OpenVid clips, 512², 8 frames.
+- Effective batch 64 videos/step (4×4×4); 15,000 steps → 960k video-views
+  ≈ **7.4 epochs** (7.68M frame-views). E2 = 3k-step warm-start.
+- Trainable: baseline **1.14B**, E1 **0.54B**.
+- LR 1e-5 constant, bf16, AdamW.
+- Eval (as-configured): **1 prompt, qualitative**, every 1000 steps.
+
+### Verdict
+**Training budget is enough for SCREENING; the EVALUATION is the limiting
+flaw.** Decisions are not defensible on single-prompt eyeballing + train/loss.
+
+Key reasoning:
+1. Budget is modest but reasonable for *relative ranking* on a frozen-backbone
+   adapter. Comparable works are larger: VideoLDM/Align-your-Latents temporal
+   ablations ~60k steps @ batch 36, full T2V ~402k @ batch 768, all with
+   FVD/FID/CLIPSIM/human eval; AnimateDiff motion modules trained on
+   WebVid-10M. So 15k = first-pass pruning, not subtle final ranking.
+2. **Critical**: switch-mode (`pred_x0_renoise` vs `repeat`) and largely
+   bridge/boundary effects appear at **inference**, not in train/loss — so
+   loss curves CANNOT rank those axes. Need a quantitative multi-prompt
+   inference metric.
+3. Capacity (0.54–1.14B) is **not** the bottleneck — huge vs SimDA's 24M and
+   AnimateDiff's ~417–453M. We are data/eval/optimization-limited, not
+   capacity-limited (supports A3's "compress capacity" thesis).
+4. Ablation deltas can be **below run-to-run (seed/data-order) noise** at 15k;
+   must measure null noise with seed-repeats and use paired stats.
+
+### Minimum Viable Eval (MVE) — codex-specified, to implement as one script
+- **Install `open_clip`** (no single CLIP-free metric captures text-alignment;
+  RAFT+VGG only judge smoothness/anchor retention). I3D/FVD optional.
+- Per-clip metrics: `clip_t` (frame-text cosine), `clip_anchor` (anchor↔frame0
+  image cosine), `vgg_anchor` (VGG-L1 anchor↔frame0), `pix_anchor_low`
+  (64² L1), `warp_vgg` (RAFT flow-warp masked VGG error, adjacent frames),
+  `motion_mag`, `motion_cov` (frac flow>2px — static-video guardrail). Reuse
+  the RAFT+VGG code already built for the A2 diagnostic.
+- **Primary metric by axis**:
+  - cross-attn on/off → `clip_t` (guardrails warp_vgg, motion_cov)
+  - bridge smooth vs hard → `warp_vgg` (guardrails clip_t, vgg_anchor)
+  - boundary on/off → `vgg_anchor`/`pix_anchor_low`
+  - switch pred_x0 vs repeat → `vgg_anchor`/`clip_anchor`
+  - anchor on/off (E2) → `clip_anchor` then `vgg_anchor`
+- **Prompts/seeds**: 96 prompts × 3 seeds at ONE operating point
+  (CFG=8, t1=0.5), identical prompt/seed pairs across all models. Prompt mix:
+  24 each of human/animal action, object/vehicle motion, camera/scene motion,
+  compositional. Do NOT sweep the full 4×t1 × 2×CFG grid for first decisions;
+  run a 32-prompt × 2-seed × full-grid stress test only for
+  winner+baseline+nearest competitor. Ranking reversal across operating
+  points → axis "unresolved".
+- **Decision rule** (paired only):
+  1. per-prompt delta vs baseline at identical seeds; average over seeds;
+  2. 20% trimmed mean across prompts; 10k-bootstrap 95% CI;
+  3. estimate `sigma_null` from ~6 baseline seeds split into halves;
+  4. "different" iff 95% CI excludes 0 AND |delta| > 2·sigma_null;
+  5. "winner" iff primary passes AND no guardrail regresses > max(1·sigma_null,
+     5% rel); reject if `motion_cov` drops >15% (frozen-video fake win).
+- **FVD proxy**: VGG-Frechet OK for internal ranking only; SDXL-VAE-Frechet
+  too model-biased; install a real video feature extractor only for
+  publication-grade claims.
+
+### Action items
+- [ ] Build `diagnostics/ablation_eval.py` (reuse A2's RAFT+VGG; add open_clip
+      + the metric set + paired bootstrap decision rule).
+- [ ] `pip install open_clip_torch` in the `video` env.
+- [ ] Curate a 96-prompt benchmark (4 buckets × 24), held-out from training.
+- [ ] Keep 15k as the screening checkpoint; treat decisions as provisional
+      until MVE is run with seed-repeat null-noise check.
+
+## 9. E3 + E4 pre-implementation (2026-05-29/30)
+
+Implemented ahead of the eval decision so they can run as **parallel 3k-step
+warm-start continuations from E1** (alongside E2) once GPUs free, then be judged
+together by the eval harness. All gated behind new config keys defaulting to
+old behavior — the 4 running experiments are unaffected.
+
+### E3 — `latent_calibrator` gate_scaled (§3 U2)
+`framegen/latent_calibrator.py`:
+- New `apply_mode: "gate_scaled"`; new conditioning flags
+  `use_bridge_gate`, `use_log_snr` → scalar FiLM projections of g(t) / log-SNR.
+- `forward(..., bridge_gate=None)`: in gate_scaled mode the residual scale is
+  multiplied by g(t), so the calibrator corrects continuously in proportion to
+  surviving anchor bias and vanishes as g(t)→0 (no hard switch).
+`train.py`:
+- Passes `image_first_bridge_gate_values` into the calibrator; in gate_scaled
+  mode applies the calibrated latents everywhere (no hard mask) and weights the
+  map/norm aux losses by the soft gate.
+Verified: gate_scaled forward runs, zero-init identity holds at init.
+
+Configs (warm-start E1, 3k steps, mid+up placement, cross-attn off):
+- `image_first_smooth_snr_renoise_boundary_calib.yaml` (calibrator only)
+- `image_first_smooth_snr_renoise_boundary_anchor_calib.yaml` (anchor + calibrator = the "both" cell)
+
+### E4 — rollout pred_x0 bridge source (§3 U3)
+`train.py`:
+- `rollout_image_first_anchor_pred_x0(...)`: noises z*_1 at a FIXED
+  `source_timestep`, denoises `rollout_source_steps` with base SDXL (adapters
+  off), returns the model's **pred_x0** (via `predict_clean_latents_from_epsilon`)
+  — an x0-like latent, so plugging it into the smooth-SNR bridge does NOT
+  double-count noise (codex's correction).
+- New flag `image_first_smooth_anchor_source ∈ {clean_first_frame,
+  rollout_pred_x0}`. In smooth_snr, rollout_pred_x0 replaces the repeated
+  z*_1 bridge source with the repeated rollout pred_x0.
+Config: `image_first_smooth_snr_renoise_boundary_rollout.yaml`.
+
+### Schema + safety
+- Added `latent_calibrator.conditioning.{use_bridge_gate,use_log_snr}` and
+  `training.{image_first_smooth_anchor_source,image_first_rollout_source_timestep,
+  image_first_rollout_source_steps}` to all configs with inert defaults
+  (`test_train_configs_share_same_schema` passes, 19 configs).
+- All new behavior is gated; the 4 in-flight runs (calibrator disabled,
+  anchor_source=clean_first_frame) are byte-for-byte unaffected in behavior.
+
+### The four E1-derived continuations (run together for clean comparison)
+| run | anchor | calibrator | bridge source |
+|-----|:---:|:---:|---|
+| E2  `..._anchor` | ✓ | — | clean z*_1 |
+| E3a `..._calib` | — | gate_scaled | clean z*_1 |
+| E3b `..._anchor_calib` | ✓ | gate_scaled | clean z*_1 |
+| E4  `..._rollout` | — | — | rollout pred_x0 |
+
+Launchers: `scripts/train_image_first_smooth_snr_renoise_boundary_{calib,anchor_calib,rollout}.sh`.

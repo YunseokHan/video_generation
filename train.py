@@ -33,7 +33,11 @@ try:
 except ImportError:  # pragma: no cover - tqdm is expected in the training env.
     tqdm = None
 
-from framegen.checkpointing import save_checkpoint
+from framegen.checkpointing import (
+    load_video_attention_adapter_checkpoint,
+    load_video_resnet_adapter_checkpoint,
+    save_checkpoint,
+)
 from framegen.config import as_project_path, get_torch_dtype, load_config, save_config
 from framegen.data import build_dataset, flatten_video_batch, video_collate_fn
 from framegen.generation import generate_video_frames, guidance_scale_label
@@ -698,6 +702,85 @@ def rollout_image_first_anchor_latents(
     return torch.stack(outputs, dim=0)
 
 
+@torch.no_grad()
+def rollout_image_first_anchor_pred_x0(
+    unet,
+    noise_scheduler: DDPMScheduler,
+    anchor_latents: torch.Tensor,
+    source_timestep: int,
+    rollout_steps: int,
+    prompt_embeds: torch.Tensor,
+    pooled_prompt_embeds: torch.Tensor,
+    add_time_ids: torch.Tensor,
+    noise_offset: float = 0.0,
+) -> torch.Tensor:
+    """Rollout a clean-x0 estimate of the anchor image (Agenda U3 E4).
+
+    Noises the clean first-frame latent at a FIXED ``source_timestep`` (codex's
+    "K fixed"), runs the base SDXL UNet with video adapters off for
+    ``rollout_steps``, then returns the model's predicted x0 at the final step.
+    This is an x0-like latent (not a noisy latent), so it can be plugged into the
+    smooth-SNR bridge as the anchor source without double-counting noise. Callers
+    duplicate it across frames.
+    """
+
+    if anchor_latents.ndim != 4:
+        raise ValueError(f"Expected anchor_latents [B, C, H, W], got {tuple(anchor_latents.shape)}.")
+    batch_size = anchor_latents.shape[0]
+    max_timestep = int(noise_scheduler.config.num_train_timesteps) - 1
+    start_t = max(0, min(max_timestep, int(source_timestep)))
+    steps = max(1, int(rollout_steps))
+    stop_t = max(0, start_t - steps)
+
+    adapter_snapshot = _snapshot_adapter_states(unet)
+    training_states = _set_eval_temporarily(unet)
+    outputs: list[torch.Tensor] = []
+    try:
+        _set_adapter_snapshot_active(adapter_snapshot, active=False)
+        for index in range(batch_size):
+            timestep_tensor = torch.tensor([start_t], device=anchor_latents.device, dtype=torch.long)
+            noise = torch.randn_like(anchor_latents[index : index + 1])
+            noise = add_noise_offset(noise, float(noise_offset))
+            latent = noise_scheduler.add_noise(anchor_latents[index : index + 1], noise, timestep_tensor)
+
+            current_t = start_t
+            pre_step_latent = latent
+            last_eps = None
+            last_t = start_t
+            while current_t > stop_t:
+                step_timestep = torch.tensor(current_t, device=anchor_latents.device, dtype=torch.long)
+                latent_model_input = noise_scheduler.scale_model_input(latent, step_timestep)
+                model_pred = unet(
+                    latent_model_input,
+                    step_timestep,
+                    encoder_hidden_states=prompt_embeds[index : index + 1],
+                    added_cond_kwargs={
+                        "text_embeds": pooled_prompt_embeds[index : index + 1],
+                        "time_ids": add_time_ids[index : index + 1],
+                    },
+                ).sample
+                pre_step_latent = latent
+                last_eps = model_pred
+                last_t = current_t
+                latent = noise_scheduler.step(model_pred, current_t, latent, return_dict=False)[0]
+                current_t -= 1
+
+            # Predicted x0 from the final epsilon: pred_x0 = (z_t - sqrt(1-abar)*eps)/sqrt(abar).
+            last_t_tensor = torch.tensor([last_t], device=anchor_latents.device, dtype=torch.long)
+            pred_x0 = predict_clean_latents_from_epsilon(
+                noisy_latents=pre_step_latent,
+                epsilon=last_eps,
+                noise_scheduler=noise_scheduler,
+                timesteps=last_t_tensor,
+            )
+            outputs.append(pred_x0[0])
+    finally:
+        _restore_adapter_snapshot(adapter_snapshot)
+        _restore_training_states(training_states)
+
+    return torch.stack(outputs, dim=0)
+
+
 def compute_clean_latent_epsilon_target(
     noisy_latents: torch.Tensor,
     clean_latents: torch.Tensor,
@@ -1262,6 +1345,7 @@ def main() -> None:
     training_config.setdefault("checkpointing_steps", 500)
     training_config.setdefault("checkpoints_total_limit", None)
     training_config.setdefault("resume_from_checkpoint", None)
+    training_config.setdefault("init_from_checkpoint", None)
     training_config.setdefault("gradient_accumulation_steps", 1)
     training_config.setdefault("gradient_checkpointing", False)
     training_config.setdefault("learning_rate", 1.0e-4)
@@ -1294,6 +1378,9 @@ def main() -> None:
     training_config.setdefault("image_first_boundary_snr", None)
     training_config.setdefault("image_first_boundary_lowfreq_only", True)
     training_config.setdefault("image_first_boundary_downsample_factor", 4)
+    training_config.setdefault("image_first_smooth_anchor_source", "clean_first_frame")
+    training_config.setdefault("image_first_rollout_source_timestep", 600)
+    training_config.setdefault("image_first_rollout_source_steps", 4)
     training_config.setdefault("image_first_rollout_steps", 0)
     training_config.setdefault("image_first_rollout_noise_offset", 0.0)
     training_config.setdefault("image_first_rollout_switch_noise_scale", 0.0)
@@ -1361,6 +1448,7 @@ def main() -> None:
     video_attention_config = VideoAttentionAdapterConfig.from_config(
         video_adapter_config.get("attention")
     )
+    image_first_anchor_enabled = bool(video_attention_config.anchor_enabled)
     torch_dtype = get_torch_dtype(model_config.get("dtype", "bf16"))
     vae_dtype = get_torch_dtype(model_config.get("vae_dtype", "fp32"))
     output_dir = as_project_path(training_config["output_dir"], project_root)
@@ -1428,6 +1516,19 @@ def main() -> None:
         IMAGE_FIRST_BRIDGE_ROLLOUT_SNR,
     }
     image_first_uses_smooth_snr_bridge = image_first_bridge_mode == IMAGE_FIRST_BRIDGE_SMOOTH_SNR
+    image_first_smooth_anchor_source = str(
+        training_config.get("image_first_smooth_anchor_source", "clean_first_frame")
+    )
+    if image_first_smooth_anchor_source not in {"clean_first_frame", "rollout_pred_x0"}:
+        raise ValueError(
+            "training.image_first_smooth_anchor_source must be 'clean_first_frame' or 'rollout_pred_x0'."
+        )
+    image_first_smooth_uses_rollout_source = (
+        image_first_uses_smooth_snr_bridge
+        and image_first_smooth_anchor_source == "rollout_pred_x0"
+    )
+    image_first_rollout_source_timestep = int(training_config.get("image_first_rollout_source_timestep", 600))
+    image_first_rollout_source_steps = int(training_config.get("image_first_rollout_source_steps", 4))
     image_first_shared_noise_prob = float(training_config.get("image_first_shared_noise_prob", 0.5))
     if not 0.0 <= image_first_shared_noise_prob <= 1.0:
         raise ValueError("training.image_first_shared_noise_prob must be in [0, 1].")
@@ -1615,6 +1716,27 @@ def main() -> None:
             frame_position_encoder.to(device=device)
     if latent_calibrator is not None and not train_latent_calibrator:
         latent_calibrator.to(device=device, dtype=torch_dtype)
+
+    # Weights-only warm start (distinct from resume_from_checkpoint, which restores
+    # full accelerator state and requires an identical architecture). Used to seed
+    # a new architecture (e.g. E2: anchor branch + mid+up placement) from a prior
+    # run's adapter weights. strict=False so matching temporal weights load while
+    # missing modules (anchor) stay at their fresh init and extra modules
+    # (e.g. down-block adapters from a full-placement checkpoint) are ignored.
+    init_from_checkpoint = training_config.get("init_from_checkpoint")
+    if init_from_checkpoint and not training_config.get("resume_from_checkpoint"):
+        init_dir = as_project_path(str(init_from_checkpoint), project_root)
+        if not init_dir.exists():
+            raise FileNotFoundError(f"init_from_checkpoint not found: {init_dir}")
+        load_video_resnet_adapter_checkpoint(init_dir, unet, strict=False)
+        load_video_attention_adapter_checkpoint(init_dir, unet, strict=False)
+        temporal_mlp_payload = init_dir / "temporal_mlp.pt"
+        if temporal_mlp_payload.exists():
+            payload = torch.load(temporal_mlp_payload, map_location="cpu")
+            temporal_mlp.load_state_dict(payload["state_dict"], strict=False)
+        sync_video_resnet_adapter_device_dtype(unet)
+        sync_video_attention_adapter_device_dtype(unet)
+        write_status(accelerator, f"warm-started adapter weights from {init_dir} (strict=False)")
 
     trainable_count, frozen_count = count_trainable_and_frozen(
         [
@@ -2036,11 +2158,44 @@ def main() -> None:
                             else:
                                 image_first_bridge_fraction = 1.0
                         else:
-                            anchor_noising_latents = repeat_first_frame_latents(
-                                clean_latents,
-                                batch_size=batch_size,
-                                num_frames=num_frames,
-                            )
+                            if image_first_smooth_uses_rollout_source:
+                                # E4: bridge source = rollout pred_x0 of the anchor image
+                                # (x0-like, matches inference stage-1), repeated over frames,
+                                # instead of the clean first-frame latent z*_1.
+                                if prompt_embeds_image is None or pooled_prompt_embeds_image is None:
+                                    raise RuntimeError(
+                                        "rollout_pred_x0 source requires image-level prompt embeddings."
+                                    )
+                                anchor_single = clean_latents.reshape(
+                                    batch_size, num_frames, *clean_latents.shape[1:]
+                                )[:, 0]
+                                rollout_source_time_ids = compute_batch_sdxl_time_ids(
+                                    batch=batch,
+                                    num_frames=1,
+                                    fallback_resolution=resolution,
+                                    device=accelerator.device,
+                                    dtype=pooled_prompt_embeds.dtype,
+                                )
+                                rollout_pred_x0 = rollout_image_first_anchor_pred_x0(
+                                    unet=unet,
+                                    noise_scheduler=noise_scheduler,
+                                    anchor_latents=anchor_single.to(dtype=torch_dtype),
+                                    source_timestep=image_first_rollout_source_timestep,
+                                    rollout_steps=image_first_rollout_source_steps,
+                                    prompt_embeds=prompt_embeds_image.detach(),
+                                    pooled_prompt_embeds=pooled_prompt_embeds_image.detach(),
+                                    add_time_ids=rollout_source_time_ids,
+                                    noise_offset=float(training_config.get("noise_offset", 0.0)),
+                                )
+                                anchor_noising_latents = rollout_pred_x0[:, None].expand(
+                                    -1, num_frames, -1, -1, -1
+                                ).reshape_as(clean_latents).to(dtype=clean_latents.dtype)
+                            else:
+                                anchor_noising_latents = repeat_first_frame_latents(
+                                    clean_latents,
+                                    batch_size=batch_size,
+                                    num_frames=num_frames,
+                                )
                             bridge_noise, image_first_shared_noise_fraction = sample_image_first_noise(
                                 reference=anchor_noising_latents,
                                 batch_size=batch_size,
@@ -2115,6 +2270,14 @@ def main() -> None:
                         and latent_calibrator_anchor_latents is not None
                         and latent_calibrator_mask is not None
                     ):
+                        # gate_scaled: apply the calibrator everywhere (the gate inside
+                        # scales the residual continuously, ~0 where g(t)->0) and weight
+                        # the auxiliary losses by the soft gate. switch_only keeps the
+                        # original hard-masked behavior.
+                        calibrator_gate_scaled = (
+                            latent_calibrator_settings.apply_mode == "gate_scaled"
+                            and image_first_bridge_gate_values is not None
+                        )
                         calibrated_latents, latent_calibrator_delta, _ = latent_calibrator(
                             noisy_latents=noisy_latents,
                             anchor_latents=latent_calibrator_anchor_latents,
@@ -2123,20 +2286,28 @@ def main() -> None:
                             pooled_prompt_embeds=modified_pooled_prompt_embeds,
                             num_frames=num_frames,
                             noise_scheduler=noise_scheduler,
+                            bridge_gate=(
+                                image_first_bridge_gate_values if calibrator_gate_scaled else None
+                            ),
                         )
-                        calibrator_mask = _expand_latent_mask(latent_calibrator_mask, noisy_latents)
-                        noisy_latents = torch.where(calibrator_mask, calibrated_latents, noisy_latents)
+                        if calibrator_gate_scaled:
+                            noisy_latents = calibrated_latents
+                            aux_weight = image_first_bridge_gate_values.detach()
+                        else:
+                            calibrator_mask = _expand_latent_mask(latent_calibrator_mask, noisy_latents)
+                            noisy_latents = torch.where(calibrator_mask, calibrated_latents, noisy_latents)
+                            aux_weight = latent_calibrator_mask
                         if latent_calibrator_alignment_target is not None:
                             latent_calibrator_map_loss = latent_calibrator_alignment_loss(
                                 calibrated_latents=noisy_latents,
                                 target_latents=latent_calibrator_alignment_target,
-                                mask=latent_calibrator_mask,
+                                mask=aux_weight,
                                 lowfreq_only=latent_calibrator_settings.map_lowfreq_only,
                                 downsample_factor=latent_calibrator_settings.map_downsample_factor,
                             )
                         latent_calibrator_norm_loss_value = latent_calibrator_norm_loss(
                             delta=latent_calibrator_delta,
-                            mask=latent_calibrator_mask,
+                            mask=aux_weight,
                             norm_cap=latent_calibrator_settings.residual_norm_cap,
                         )
 
@@ -2252,10 +2423,21 @@ def main() -> None:
                         frame_positions=frame_positions_flat,
                         frame_embeddings=frame_adapter_pooled_flat,
                     )
+                    image_first_anchor_latents = None
+                    if (
+                        image_first_anchor_enabled
+                        and latent_init_mode == LATENT_INIT_FIRST_FRAME_REPEAT
+                    ):
+                        image_first_anchor_latents = clean_latents.reshape(
+                            batch_size,
+                            num_frames,
+                            *clean_latents.shape[1:],
+                        )[:, 0].to(dtype=torch_dtype)
                     set_video_attention_context(
                         unet,
                         num_frames=num_frames,
                         frame_tokens=frame_attention_tokens,
+                        anchor_latents=image_first_anchor_latents,
                     )
                     try:
                         model_pred = unet(

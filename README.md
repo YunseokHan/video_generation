@@ -185,6 +185,18 @@ bash scripts/diagnostic_vae_temporal.sh --smoke         # 32 clips, ~5 min
 bash scripts/diagnostic_vae_temporal.sh --num_clips 100 # recommended
 ```
 
+Ablation evaluation harness — quantitative, multi-prompt, paired comparison of
+trained checkpoints (`outputs/<name>/checkpoint-last`), all logged to one wandb
+run. See `information/13_ablation_eval.md`:
+
+```bash
+bash scripts/ablation_eval.sh \
+  --models image-first-smooth-snr-renoise-boundary,image-first-smooth-snr-renoise-boundary-xnocross \
+  --baseline image-first-smooth-snr-renoise-boundary \
+  --prompts_file diagnostics/prompts_ablation.txt \
+  --seeds 0,1,2 --baseline_extra_seeds 3,4,5 --cfg 8 --t1 0.5 --wandb
+```
+
 `configs/train/default.yaml` enables:
 
 - UNet convolutional/Resnet video adapters

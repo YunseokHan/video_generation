@@ -1,3 +1,6 @@
+# Experiment E3a: latent_calibrator gate_scaled (no anchor). Warm-start from E1.
+# Companion: information/claude-codex-discussion.md §3 U2 + §5.
+
 model:
   pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
   pretrained_vae_model_name_or_path: null
@@ -48,9 +51,9 @@ temporal_conditioning:
   alpha: 1.0
 
 latent_calibrator:
-  enabled: false
+  enabled: true
   train: true
-  apply_mode: "switch_only"
+  apply_mode: "gate_scaled"
   architecture: "temporal_conv"
   latent_channels: 4
   hidden_channels: 64
@@ -63,18 +66,18 @@ latent_calibrator:
     use_frame_pos: true
     use_pooled_prompt: true
     use_anchor_latent: true
-    use_bridge_gate: false
-    use_log_snr: false
+    use_bridge_gate: true
+    use_log_snr: true
     input_mode: "concat_anchor_delta"
   residual:
     scale_mode: "clipped_snr"
     max_scale: 0.5
     norm_cap: 1.0
   auxiliary_loss:
-    map_weight: 0.0
+    map_weight: 0.05
     map_lowfreq_only: true
     map_downsample_factor: 4
-    norm_weight: 0.0
+    norm_weight: 0.001
 
 video_adapters:
   frame_position_encoder:
@@ -97,47 +100,49 @@ video_adapters:
     use_temporal_conv2: true
     use_frame_conditioning: false
   resnet:
-    placement: "all"
     enabled: true
     active: true
     train: true
+    placement: "mid_up"                        # NEW (A3.2). down|mid|up combinations; default "all"
     frame_embedding_dim: 2048
     use_temporal_conv1: true
     use_temporal_conv2: true
     use_frame_conditioning: true
   attention:
-    placement: "all"
-    anchor_conditioning:
+    enabled: true
+    active: true
+    train: true
+    placement: "mid_up"                        # NEW (A3.2)
+    use_temporal_self_attention: true
+    use_temporal_cross_attention: false        # inherited from E1
+    use_temporal_ffn: true
+    temporal_ffn_rank: 0
+    temporal_ffn_kernel_size: 3
+    temporal_ffn_gamma_init: 0.0
+    include_prompt_tokens: true
+    anchor_conditioning:                       # NEW (A1 v1)
       enabled: false
-      mode: "spatial"
+      mode: "spatial"                          # spatial | global
       projector_hidden: 128
       projector_share_by_resolution: true
       gate_init: 0.0
       gate_per_channel: false
       train_anchor_attn: true
       train_projector: true
-    enabled: true
-    active: true
-    train: true
-    use_temporal_self_attention: true
-    use_temporal_cross_attention: true
-    use_temporal_ffn: true
-    temporal_ffn_rank: 0
-    temporal_ffn_kernel_size: 3
-    temporal_ffn_gamma_init: 0.0
-    include_prompt_tokens: true
 
 training:
-  init_from_checkpoint: null
-  output_dir: "outputs/image-first-snr"
+  output_dir: "outputs/image-first-smooth-snr-renoise-boundary-calib"
   train_batch_size: 4
   gradient_accumulation_steps: 4
   learning_rate: 1.0e-5
   scale_lr: false
   lr_scheduler: "constant"
-  lr_warmup_steps: 500
+  lr_warmup_steps: 0                           # continuation fine-tune, no fresh warmup
   num_train_epochs: 100
-  max_train_steps: 15000
+  max_train_steps: 3000                        # warm-start resets the step counter to 0, so this is
+                                               # the number of NEW steps E2 trains (not 15000+3000).
+                                               # init_from_checkpoint carries only E1's adapter WEIGHTS;
+                                               # optimizer/scheduler/step counter all start fresh.
   mixed_precision: "bf16"
   train_temporal_embedding: true
   train_unet: false
@@ -152,15 +157,15 @@ training:
   latent_init_mode: "first_frame_repeat"
   image_first_noise_mode: "independent"
   image_first_shared_noise_prob: 0.5
-  image_first_bridge_mode: "snr"
+  image_first_bridge_mode: "smooth_snr"
   image_first_bridge_snr_min: null
   image_first_bridge_snr_max: 5.0
   image_first_bridge_snr_full: 1.0
   image_first_bridge_snr_zero: 5.0
   image_first_bridge_gate: "cosine"
   image_first_bridge_gate_domain: "log_snr"
-  image_first_boundary_loss_weight: 0.0
-  image_first_boundary_snr: null
+  image_first_boundary_loss_weight: 0.05
+  image_first_boundary_snr: 5.0
   image_first_boundary_lowfreq_only: true
   image_first_boundary_downsample_factor: 4
   image_first_smooth_anchor_source: "clean_first_frame"
@@ -178,9 +183,14 @@ training:
   timestep_bias_portion: 0.25
   proportion_empty_prompts: 0.0
   checkpointing_steps: 500
-  checkpoints_total_limit: null
-  resume_from_checkpoint: null
-  validation_steps: 1000
+  checkpoints_total_limit: 3
+  resume_from_checkpoint: null                 # NOT a full-state resume: E2 architecture
+                                               # (anchor branch + mid+up placement) differs from E1,
+                                               # so accelerator.load_state would fail. Use weights-only
+                                               # warm start instead (matching temporal weights load
+                                               # strict=False; anchor stays fresh at gate=0).
+  init_from_checkpoint: "outputs/image-first-smooth-snr-renoise-boundary-xnocross/checkpoint-last"
+  validation_steps: 500                        # tighter cadence during the 3k continuation
   logging_steps: 10
   logging_dir: "logs"
   seed: 42
@@ -189,11 +199,11 @@ logging:
   report_to: "wandb"
   project: "sdxl-frame-generator"
   entity: null
-  run_name: "image-first-snr"
+  run_name: "image-first-smooth-snr-renoise-boundary-calib"
   group: null
   job_type: "train"
-  tags: ["sdxl", "frame-generator", "image-first", "snr-hybrid", "sinusoidal-frame-tokens"]
-  notes: null
+  tags: ["sdxl", "frame-generator", "image-first", "smooth-snr", "pred-x0-renoise", "boundary-loss", "sinusoidal-frame-tokens", "ablation-no-cross-attn", "anchor-conditioning-v1", "placement-mid-up", "experiment-E2", "continuation-finetune"]
+  notes: "E2: A1 v1 persistent anchor conditioning (spatial-aligned K/V at mid+up blocks) + A3.2 mid+up placement restriction. Continuation fine-tune from E1's checkpoint-last. anchor_conditioning.gate_init=0 so step-0 output matches E1; gate opens during fine-tune."
   log_validation_media: true
   log_training_caption_inference: false
   training_caption_inference_steps: 100
@@ -229,7 +239,7 @@ validation:
   guidance_scales: [1.0, 8.0]
   t1_ratios: [0.0, 0.25, 0.5, 0.75]
   switch_noise_scale: 0.1
-  image_first_switch_mode: "repeat_add_noise"
+  image_first_switch_mode: "pred_x0_renoise"
   image_first_renoise_noise_mode: "independent"
   image_first_renoise_noise_scale: 1.0
   fps: 8

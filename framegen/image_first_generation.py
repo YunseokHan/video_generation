@@ -303,6 +303,7 @@ def generate_image_first_video_frames(
     switch_mode: str = IMAGE_FIRST_SWITCH_REPEAT_ADD_NOISE,
     renoise_noise_mode: str = IMAGE_FIRST_RENOISE_INDEPENDENT,
     renoise_noise_scale: float = 1.0,
+    anchor_image_path: str | Path | None = None,
 ) -> list[Path]:
     if num_frames <= 0:
         raise ValueError("num_frames must be positive.")
@@ -387,6 +388,9 @@ def generate_image_first_video_frames(
             )
             latents = pipe.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
 
+        # Single-image clean anchor [1, C, H, W] for persistent anchor conditioning
+        # (Agenda A1). Prefer the pred_x0 estimate; fall back to the stage-1 latent.
+        anchor_feature_latents = None
         if switch_mode == IMAGE_FIRST_SWITCH_PRED_X0_RENOISE and first_stage_steps < len(timesteps):
             switch_timestep = timesteps[first_stage_steps]
             noise_pred = _cfg_unet_step(
@@ -408,6 +412,7 @@ def generate_image_first_video_frames(
                 timesteps=timesteps,
                 step_index=first_stage_steps,
             )
+            anchor_feature_latents = anchor_clean_latents
             anchor_latents = anchor_clean_latents.expand(int(num_frames), -1, -1, -1).contiguous()
             switch_noise = _sample_frame_noise(
                 reference=anchor_latents,
@@ -424,6 +429,7 @@ def generate_image_first_video_frames(
                 noise_scale=float(renoise_noise_scale),
             )
         else:
+            anchor_feature_latents = latents
             anchor_latents = latents.expand(int(num_frames), -1, -1, -1).contiguous()
             latents = anchor_latents
             if float(switch_noise_scale) > 0.0 and first_stage_steps < len(timesteps):
@@ -532,6 +538,7 @@ def generate_image_first_video_frames(
             pipe.unet,
             num_frames=num_frames,
             frame_tokens=frame_attention_tokens,
+            anchor_latents=anchor_feature_latents,
         )
         try:
             for timestep in timesteps[first_stage_steps:]:
@@ -567,6 +574,26 @@ def generate_image_first_video_frames(
         _restore_active_states(unet_resnet_state)
         _restore_active_states(unet_attention_state)
         _restore_active_states(vae_resnet_state)
+
+    # Optionally decode and save the single-image stage-1 anchor (pred_x0 or the
+    # stage-1 latent) for anchor-fidelity evaluation. Decoded with video adapters
+    # off so it reflects the image the video stage was conditioned on.
+    if anchor_image_path is not None and anchor_feature_latents is not None:
+        _set_active_states(unet_resnet_state, active=False)
+        _set_active_states(unet_attention_state, active=False)
+        _set_active_states(vae_resnet_state, active=False)
+        try:
+            anchor_decoded = pipe.vae.decode(
+                anchor_feature_latents.to(latents.dtype) / pipe.vae.config.scaling_factor,
+                return_dict=False,
+            )[0]
+            anchor_image = pipe.image_processor.postprocess(anchor_decoded, output_type="pil")[0]
+        finally:
+            _restore_active_states(unet_resnet_state)
+            _restore_active_states(unet_attention_state)
+            _restore_active_states(vae_resnet_state)
+        Path(anchor_image_path).parent.mkdir(parents=True, exist_ok=True)
+        anchor_image.save(anchor_image_path)
 
     output_paths: list[Path] = []
     for index, image in enumerate(images):

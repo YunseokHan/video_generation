@@ -24,6 +24,8 @@ class LatentCalibratorConfig:
     use_frame_pos: bool = True
     use_pooled_prompt: bool = True
     use_anchor_latent: bool = True
+    use_bridge_gate: bool = False
+    use_log_snr: bool = False
     input_mode: str = "concat_anchor_delta"
     residual_scale_mode: str = "clipped_snr"
     residual_max_scale: float = 0.5
@@ -58,6 +60,8 @@ class LatentCalibratorConfig:
             use_frame_pos=bool(conditioning.get("use_frame_pos", cls.use_frame_pos)),
             use_pooled_prompt=bool(conditioning.get("use_pooled_prompt", cls.use_pooled_prompt)),
             use_anchor_latent=bool(conditioning.get("use_anchor_latent", cls.use_anchor_latent)),
+            use_bridge_gate=bool(conditioning.get("use_bridge_gate", cls.use_bridge_gate)),
+            use_log_snr=bool(conditioning.get("use_log_snr", cls.use_log_snr)),
             input_mode=str(conditioning.get("input_mode", cls.input_mode)),
             residual_scale_mode=str(residual.get("scale_mode", cls.residual_scale_mode)),
             residual_max_scale=float(residual.get("max_scale", cls.residual_max_scale)),
@@ -134,8 +138,10 @@ class TemporalConvLatentCalibrator(nn.Module):
         )
         if self.config.architecture != "temporal_conv":
             raise ValueError("Only latent_calibrator.architecture='temporal_conv' is implemented.")
-        if self.config.apply_mode not in {"switch_only", "training"}:
-            raise ValueError("Only latent_calibrator.apply_mode='switch_only' is implemented.")
+        if self.config.apply_mode not in {"switch_only", "training", "gate_scaled"}:
+            raise ValueError(
+                "latent_calibrator.apply_mode must be switch_only, training, or gate_scaled."
+            )
         if self.config.latent_channels <= 0:
             raise ValueError("latent_calibrator.latent_channels must be positive.")
         if self.config.hidden_channels <= 0:
@@ -198,6 +204,18 @@ class TemporalConvLatentCalibrator(nn.Module):
             if self.config.use_pooled_prompt
             else None
         )
+        # Scalar conditioning on the smooth-SNR bridge gate g(t) and/or log-SNR,
+        # so a gate_scaled calibrator knows how much anchor bias survived the blend.
+        self.gate_proj = (
+            nn.Sequential(nn.Linear(1, hidden_channels), nn.SiLU(), nn.Linear(hidden_channels, hidden_channels))
+            if self.config.use_bridge_gate
+            else None
+        )
+        self.logsnr_proj = (
+            nn.Sequential(nn.Linear(1, hidden_channels), nn.SiLU(), nn.Linear(hidden_channels, hidden_channels))
+            if self.config.use_log_snr
+            else None
+        )
         self.blocks = nn.ModuleList(
             [FiLMResBlock2D(hidden_channels, cond_dim) for _ in range(self.config.num_blocks)]
         )
@@ -230,6 +248,8 @@ class TemporalConvLatentCalibrator(nn.Module):
         frame_positions: torch.Tensor,
         pooled_prompt_embeds: torch.Tensor,
         dtype: torch.dtype,
+        bridge_gate: torch.Tensor | None = None,
+        log_snr: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_frames = timesteps.reshape(-1).shape[0]
         cond = torch.zeros(
@@ -254,6 +274,12 @@ class TemporalConvLatentCalibrator(nn.Module):
                     f"{pooled_prompt_embeds.shape[-1]} vs {self.config.prompt_embedding_dim}."
                 )
             cond = cond + self.prompt_proj(pooled_prompt_embeds.to(device=timesteps.device, dtype=dtype))
+        if self.gate_proj is not None and bridge_gate is not None:
+            gate_values = bridge_gate.reshape(-1, 1).to(device=timesteps.device, dtype=dtype)
+            cond = cond + self.gate_proj(gate_values)
+        if self.logsnr_proj is not None and log_snr is not None:
+            logsnr_values = log_snr.reshape(-1, 1).to(device=timesteps.device, dtype=dtype)
+            cond = cond + self.logsnr_proj(logsnr_values)
         return cond
 
     def _residual_scale(self, timesteps: torch.Tensor, noise_scheduler, dtype: torch.dtype) -> torch.Tensor:
@@ -274,6 +300,12 @@ class TemporalConvLatentCalibrator(nn.Module):
             scale = scale.unsqueeze(-1)
         return scale.to(dtype=dtype)
 
+    def _log_snr(self, timesteps: torch.Tensor, noise_scheduler, dtype: torch.dtype) -> torch.Tensor:
+        alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=timesteps.device, dtype=torch.float32)
+        alpha = alphas_cumprod[timesteps.reshape(-1).long()]
+        snr = alpha / (1.0 - alpha).clamp_min(1.0e-12)
+        return snr.clamp_min(1.0e-12).log().to(dtype=dtype)
+
     def forward(
         self,
         noisy_latents: torch.Tensor,
@@ -283,6 +315,7 @@ class TemporalConvLatentCalibrator(nn.Module):
         pooled_prompt_embeds: torch.Tensor,
         num_frames: int,
         noise_scheduler,
+        bridge_gate: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if noisy_latents.shape != anchor_latents.shape:
             raise ValueError(
@@ -298,11 +331,18 @@ class TemporalConvLatentCalibrator(nn.Module):
         compute_dtype = self.input_proj.weight.dtype
         noisy_latents_compute = noisy_latents.to(dtype=compute_dtype)
         anchor_latents_compute = anchor_latents.to(dtype=compute_dtype)
+        log_snr = (
+            self._log_snr(timesteps, noise_scheduler, compute_dtype)
+            if self.logsnr_proj is not None
+            else None
+        )
         cond = self._conditioning(
             timesteps=timesteps,
             frame_positions=frame_positions,
             pooled_prompt_embeds=pooled_prompt_embeds,
             dtype=compute_dtype,
+            bridge_gate=bridge_gate,
+            log_snr=log_snr,
         )
         if self.config.use_anchor_latent:
             inputs = torch.cat(
@@ -326,6 +366,14 @@ class TemporalConvLatentCalibrator(nn.Module):
         if norm_cap > 0:
             raw_delta = norm_cap * torch.tanh(raw_delta / norm_cap)
         scale = self._residual_scale(timesteps, noise_scheduler, dtype=compute_dtype)
+        # gate_scaled: also scale the residual by the smooth-SNR bridge gate g(t),
+        # so the calibrator only corrects in proportion to surviving anchor bias and
+        # smoothly vanishes where g(t)->0 (no hard switch boundary).
+        if self.config.apply_mode == "gate_scaled" and bridge_gate is not None:
+            gate = bridge_gate.reshape(-1).to(device=scale.device, dtype=compute_dtype)
+            while gate.ndim < scale.ndim:
+                gate = gate.unsqueeze(-1)
+            scale = scale * gate
         delta = scale * raw_delta
         delta = delta.to(dtype=output_dtype)
         scale = scale.to(dtype=output_dtype)

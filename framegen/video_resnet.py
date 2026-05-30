@@ -18,6 +18,7 @@ class VideoResnetAdapterConfig:
     enabled: bool = False
     active: bool = True
     train: bool = True
+    placement: str = "all"
     frame_embedding_dim: int = 1
     use_temporal_conv1: bool = True
     use_temporal_conv2: bool = True
@@ -30,6 +31,7 @@ class VideoResnetAdapterConfig:
             enabled=bool(values.get("enabled", cls.enabled)),
             active=bool(values.get("active", cls.active)),
             train=bool(values.get("train", cls.train)),
+            placement=str(values.get("placement", cls.placement) or cls.placement),
             frame_embedding_dim=int(values.get("frame_embedding_dim", cls.frame_embedding_dim)),
             use_temporal_conv1=bool(values.get("use_temporal_conv1", cls.use_temporal_conv1)),
             use_temporal_conv2=bool(values.get("use_temporal_conv2", cls.use_temporal_conv2)),
@@ -373,7 +375,11 @@ def inject_video_resnet_adapters(
             else:
                 replace_children(child)
 
-    replace_children(module)
+    from framegen.video_attention import _placement_roots, resolve_unet_placement_sections
+
+    sections = resolve_unet_placement_sections(adapter_config.placement)
+    for root in _placement_roots(module, sections):
+        replace_children(root)
     return replaced
 
 

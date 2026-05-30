@@ -7,23 +7,18 @@
 # from undoing E1's cross-attn-removal saving. Target trainable budget < 0.5B.
 #
 # ==========================================================================
-# IMPORTANT: this config IS NOT YET RUNNABLE. It references new fields that
-# require code changes listed in information/claude-codex-discussion.md
-# §5 Experiment E2 (B-2, B-3, B-4):
+# RUNNABLE as of 2026-05-29. The code paths below are implemented:
+#   * video_adapters.attention.placement="mid_up"  -> resolve_unet_placement_sections
+#                                                      + _placement_roots in
+#                                                      framegen/video_attention.py
+#   * video_adapters.{resnet,attention}.placement  -> same, via VideoResnetAdapterConfig
+#   * anchor_conditioning.*  -> gated spatial anchor K/V branch in
+#                               VideoBasicTransformerBlock (gate zero-init = identity)
+#   * train.py  -> anchor = clean_latents[:,0] passed to set_video_attention_context
+#   * framegen/image_first_generation.py -> anchor = stage-1 pred_x0 at the switch
+#   * train.py training.init_from_checkpoint -> weights-only warm start (strict=False)
 #
-#   * video_adapters.attention.placement                  -> requires block_filter
-#                                                            in framegen/video_attention.py
-#                                                            inject path
-#   * video_adapters.attention.anchor_conditioning.*      -> requires new anchor-attn
-#                                                            branch inside
-#                                                            VideoBasicTransformerBlock
-#                                                            + projector + gate
-#   * train.py wiring of anchor_clean = z*_1
-#   * framegen/image_first_generation.py wiring of
-#     anchor_clean = pred_x0 at switch
-#
-# Until those code paths exist, this config would silently degrade to E1 with
-# a resume from E1's checkpoint, which is NOT what you want.
+# Launch only AFTER E1 has written checkpoint-last (this resumes E1's weights).
 # ==========================================================================
 #
 # Companion: information/claude-codex-discussion.md §5 Experiment E2.
@@ -93,6 +88,8 @@ latent_calibrator:
     use_frame_pos: true
     use_pooled_prompt: true
     use_anchor_latent: true
+    use_bridge_gate: false
+    use_log_snr: false
     input_mode: "concat_anchor_delta"
   residual:
     scale_mode: "clipped_snr"
@@ -164,7 +161,10 @@ training:
   lr_scheduler: "constant"
   lr_warmup_steps: 0                           # continuation fine-tune, no fresh warmup
   num_train_epochs: 100
-  max_train_steps: 18000                       # 3000 continuation steps on top of E1's 15000
+  max_train_steps: 3000                        # warm-start resets the step counter to 0, so this is
+                                               # the number of NEW steps E2 trains (not 15000+3000).
+                                               # init_from_checkpoint carries only E1's adapter WEIGHTS;
+                                               # optimizer/scheduler/step counter all start fresh.
   mixed_precision: "bf16"
   train_temporal_embedding: true
   train_unet: false
@@ -190,6 +190,9 @@ training:
   image_first_boundary_snr: 5.0
   image_first_boundary_lowfreq_only: true
   image_first_boundary_downsample_factor: 4
+  image_first_smooth_anchor_source: "clean_first_frame"
+  image_first_rollout_source_timestep: 600
+  image_first_rollout_source_steps: 4
   image_first_rollout_steps: 0
   image_first_rollout_noise_offset: 0.0
   image_first_rollout_switch_noise_scale: 0.0
@@ -203,7 +206,12 @@ training:
   proportion_empty_prompts: 0.0
   checkpointing_steps: 500
   checkpoints_total_limit: null
-  resume_from_checkpoint: "outputs/image-first-smooth-snr-renoise-boundary-xnocross/checkpoint-last"
+  resume_from_checkpoint: null                 # NOT a full-state resume: E2 architecture
+                                               # (anchor branch + mid+up placement) differs from E1,
+                                               # so accelerator.load_state would fail. Use weights-only
+                                               # warm start instead (matching temporal weights load
+                                               # strict=False; anchor stays fresh at gate=0).
+  init_from_checkpoint: "outputs/image-first-smooth-snr-renoise-boundary-xnocross/checkpoint-last"
   validation_steps: 500                        # tighter cadence during the 3k continuation
   logging_steps: 10
   logging_dir: "logs"

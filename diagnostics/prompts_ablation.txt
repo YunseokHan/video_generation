@@ -1,0 +1,34 @@
+# Ablation eval prompt set. 4 buckets. Expand toward 24/bucket (96 total) for a
+# full MVE sweep; this starter has 6/bucket (24). Lines starting with # ignored.
+
+# --- human / animal action ---
+A dog running through a grassy field, cinematic lighting
+A person riding a skateboard down a city sidewalk
+A cat jumping onto a kitchen counter, slow motion
+A ballerina spinning on a dimly lit stage
+A horse galloping across a desert plain at sunset
+A child kicking a soccer ball in a backyard
+
+# --- object / vehicle motion ---
+A red sports car driving down a coastal highway at sunset
+A train speeding past a rural station, motion blur
+A paper airplane gliding through a sunlit room
+A hot air balloon rising over green hills
+A sailboat cutting through choppy ocean water
+A bicycle wheel spinning, close up
+
+# --- camera / scene motion ---
+Aerial drone shot flying over a snowy mountain range
+Time-lapse of clouds moving over a city skyline at dusk
+A slow pan across a neon-lit Tokyo street at night
+A dolly zoom into a dense pine forest
+Underwater camera drifting over a coral reef
+A camera orbiting a lit campfire in the dark
+
+# --- compositional / multi-object ---
+Two people shaking hands in a busy office lobby
+A chef plating a dish while steam rises from a pan
+A flock of birds scattering from a city fountain
+A barista pouring latte art into a white cup
+Rain falling on a window with a blurred street behind
+A market stall with hanging lanterns swaying in the wind

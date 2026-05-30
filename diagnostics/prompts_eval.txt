@@ -1,0 +1,103 @@
+# Ablation eval prompt set = curated synthetic + held-out OpenVid captions.
+# Built by diagnostics/build_eval_prompts.py (seed=42, holdout_pct=10, min_motion=2.0).
+# synthetic=24  openvid_heldout=72  total=96
+#
+# --- curated synthetic ---
+A dog running through a grassy field, cinematic lighting
+A person riding a skateboard down a city sidewalk
+A cat jumping onto a kitchen counter, slow motion
+A ballerina spinning on a dimly lit stage
+A horse galloping across a desert plain at sunset
+A child kicking a soccer ball in a backyard
+A red sports car driving down a coastal highway at sunset
+A train speeding past a rural station, motion blur
+A paper airplane gliding through a sunlit room
+A hot air balloon rising over green hills
+A sailboat cutting through choppy ocean water
+A bicycle wheel spinning, close up
+Aerial drone shot flying over a snowy mountain range
+Time-lapse of clouds moving over a city skyline at dusk
+A slow pan across a neon-lit Tokyo street at night
+A dolly zoom into a dense pine forest
+Underwater camera drifting over a coral reef
+A camera orbiting a lit campfire in the dark
+Two people shaking hands in a busy office lobby
+A chef plating a dish while steam rises from a pan
+A flock of birds scattering from a city fountain
+A barista pouring latte art into a white cup
+Rain falling on a window with a blurred street behind
+A market stall with hanging lanterns swaying in the wind
+
+# --- held-out OpenVid captions (deterministic hash partition) ---
+In the video, a man and a woman are seen preparing food in a kitchen. The man is holding a loaf of bread, while the woman is using a hand mixer.
+a hand with green nail polish is seen holding a white egg. The hand is positioned such that the thumb and index finger are gripping the egg. The egg is not alone; it's nestled in a pile of similar white eggs.
+The video is an aerial view of a serene countryside landscape. It features a quaint stone cottage nestled in a lush green field, surrounded by a small pond.
+The video features a man wearing sunglasses and a white shirt, sitting on a boat. The boat is moving through the water, leaving a wake behind it.
+a breathtaking view of a mountainous landscape at sunset. The vantage point appears to be from a high altitude, overlooking a vast expanse of water that mirrors the warm hues of the setting sun.
+an aerial view of a serene camping site nestled by a lake. The campsite is situated on a small island, surrounded by the tranquil blue water of the lake.
+a woman is standing on a rocky cliff that overlooks the vast expanse of the ocean. She is holding a blue sarong in her hands, which is adorned with a vibrant floral pattern.
+an aerial view of a desert landscape, dominated by a long, straight road that cuts through the heart of the scene. The road, painted in a striking shade of blue, serves as a stark contrast to the surrounding sand dunes.
+The video shows a man walking down a dirt road in a rural village. The man is wearing a plaid shirt and is looking to his left. The village consists of several small houses with blue roofs.
+The video captures a person enjoying a meal at a table. The person is holding a large, delicious-looking taco filled with meat, lettuce, and other toppings.
+The video shows a large orange tabby cat sitting in a white laundry basket. The cat appears to be relaxed and comfortable, with its body partially curled up.
+The video features a woman with striking blue eyes and dark hair, wearing a black leather choker and multiple necklaces. She is dressed in a black jacket and has a serious expression on her face.
+In the heart of a serene woodland, a gray dog with a white collar is captured in mid-stride, its body elongated as it walks on all fours.
+a vibrant scene from nature. Dominating the center of the frame is a sunflower, its bright yellow petals radiating outwards from a dark brown center.
+a serene autumn scene. Dominating the left side of the frame is a river, its calm waters reflecting the muted colors of the surrounding landscape.
+In the video, a man is seen standing in front of a car with its hood open. He is wearing a denim jacket and sunglasses, and appears to be gesturing with his hands as if explaining something.
+a serene scene of nature. Dominating the foreground are tall trees, their leaves a vibrant mix of yellow and orange hues, suggesting the arrival of autumn.
+The video shows a young boy with brown hair, wearing a blue shirt. He is seen in three different frames, each capturing a different expression or emotion.
+The video shows a man wearing a white face mask, which covers his nose and mouth. He is looking directly at the camera, and his expression is neutral. The man is wearing a pink shirt.
+a serene scene of a coastal road. The road, curving gently to the right, is bordered by a white and gray concrete wall on the right side.
+The video shows a man in a red jacket and a red and white striped hat with a pom pom on top, standing in a snowy outdoor setting.
+a mesmerizing scene from an underwater aquarium. Dominating the center of the frame is a large gray shark, its body sleek and graceful as it swims towards the top of the scene.
+The video captures a soccer player in a white uniform with black stripes, celebrating a goal. He is kneeling on the ground with his arms outstretched, a wide smile on his face.
+a captivating view of a spiral staircase, captured from an aerial perspective. The staircase, which is the central focus of the scene, spirals outwards from the center, creating a mesmerizing effect.
+a tranquil scene of nature. A fallen tree branch, dark brown in color, lies partially submerged in a shallow stream.
+The video shows two men in a field, one wearing a red helmet and the other a green beret. The man in the green beret is holding a blue object, possibly a phone or a device.
+The video is a black and white film featuring a man in a suit and tie. The man is smiling and appears to be in a good mood. He is seated in a chair and is looking to his left.
+an aerial view of a serene residential area, nestled by the side of a tranquil canal. The houses, predominantly white with gray roofs, are arranged in a grid-like pattern, suggesting a well-planned urban layout.
+a serene winter scene. Dominating the foreground is a frozen lake, its surface blanketed in a layer of pristine white snow. The lake extends towards the horizon, where it meets a city skyline.
+The video features a woman with curly hair, wearing a silver necklace, and a brown top. She is standing on a staircase with a railing. Her facial expression changes from a neutral look to a surprised or shocked one.
+The video features a young woman with glasses, smiling at the camera. She has long brown hair and is wearing a white top.
+a serene scene of a river coursing through a mountainous landscape. The river, exhibiting a light blue hue, meanders from the left to the right side of the frame.
+The video features a young woman with blonde hair, wearing a brown top and a necklace. She is seen in three different frames, each capturing her in a different pose and expression.
+The video shows a man sitting in a car, holding a glass of yellow liquid. He is wearing a black leather jacket and has a slight smile on his face. The car appears to be in motion, as suggested by the blurred background.
+In the video, a person is playing with a doctor doll and a patient doll. The doctor doll is wearing a white coat and a stethoscope, and is holding a red medical kit.
+The video features a man with a beard and short hair, who is speaking into a microphone. He is wearing a gray shirt and appears to be in a room with a white wall in the background.
+a serene scene of a blue and white train journeying across a concrete bridge over a river. The train, moving from the left to the right of the frame, adds a dynamic element to the otherwise tranquil setting.
+a serene scene of a beach at sunset. The sky, painted in hues of orange and pink, meets the deep blue water at the horizon. The beach, with its light beige sand, stretches out towards the water.
+a child's hand is gently resting on a clear plastic tray filled with Easter eggs. The tray contains three eggs, each a different color: blue, pink, and yellow.
+an expansive aerial view of a densely packed village nestled in a hilly area. The village is a labyrinth of narrow, winding roads that crisscross and intertwine, creating a complex network of pathways.
+The video features a woman with short, wavy hair, wearing a pink blouse. She is standing in a room with a white door in the background. The woman is looking to her left with a slight smile on her face.
+The video is a close-up of a man sitting in the back seat of a car. He is wearing a striped shirt and has a beard. The car's interior is visible, with the man's seatbelt on.
+The video shows a close-up of a black wheel with a shiny chrome rim. The wheel is positioned in the center of the frame, and the camera angle is slightly angled, giving a clear view of the wheel's design.
+a serene scene of a sunrise over a tree-lined road. The sun, rising in the top left corner, casts a warm glow through the trees, illuminating the scene with a soft light.
+a serene scene of a waterfall cascading down a rocky cliff into a river. The waterfall, located on the left side of the scene, is surrounded by lush green trees and foliage, creating a sense of tranquility.
+In the video, a person is seen kneeling down to pick up a small wicker basket filled with red tulips. The basket is placed on the ground, and the person carefully reaches for it.
+In the vast expanse of the savanna, two majestic elephants grace the scene. The elephant in the foreground, a magnificent creature with a light brown hide and large white tusks, is captured in a moment of tranquility.
+a serene scene of a rocky shoreline. The rocks, exhibiting hues of brown and gray, are scattered across the frame, their rough textures adding a sense of ruggedness to the landscape.
+a tranquil scene of a person walking on a dirt road during the early hours of the day. The person, dressed in a black shirt and pants, is seen from behind, adding an air of mystery to the scene.
+The video features a woman with a classic, elegant style. She has dark hair styled in a vintage fashion, and her makeup is done in a way that accentuates her features.
+The video shows a man in a red and blue soccer jersey, standing on a grassy field. He is making a funny face and appears to be in a playful or humorous mood.
+a vast desert landscape under a stunning pink and purple sunset. The desert is characterized by light beige sand dunes that stretch out to the horizon.
+a young woman with long brown hair is the main subject. She is leaning on a wooden fence, her back facing the camera, giving us a view of her white t-shirt.
+The video captures a dramatic scene of a forest fire. The first frame shows a small fire burning in the distance, surrounded by trees.
+The video features a man with a long beard and a black hat, who appears to be in a state of distress or disarray.
+In the video, a person is seen preparing a batter in a large metal bowl on a wooden table. The person is pouring a white liquid, likely milk or water, into the bowl.
+The video features a woman with blonde hair and a pink jacket. She is wearing gold earrings and appears to be speaking. The background is dark, which contrasts with her light-colored hair and jacket.
+a single, golden star that stands out against a solid blue background. The star, which is the sole object in the scene, is centrally located and occupies most of the space.
+The video shows a man standing in a kitchen, smiling and looking at the camera. He is shirtless, revealing his bare torso. The kitchen is equipped with a refrigerator, which is covered in various magnets and papers.
+The video features a woman with short hair, wearing a leopard print jacket and a large necklace. She is seated in a red chair, smiling and looking directly at the camera.
+The video features a woman with closed eyes, appearing to be in a state of relaxation or perhaps deep thought. She is wearing a blue shirt and has her hair pulled back.
+The video features a man with a distinctive appearance, characterized by his gray hair and beard, which are styled in an unkempt manner.
+The video is an aerial view of a rural countryside road. The road is curving and surrounded by lush green fields and trees with autumn foliage.
+an aerial view of a serene rural setting. Dominating the scene is a tranquil river, its calm waters reflecting the clear blue sky above.
+The video captures a triumphant moment of a football player, who is the center of attention. He is holding a black cap with the word "CHAMPIONS" written on it, signifying his team's victory.
+The video shows a man working on a yellow car in a garage. He is wearing a black shirt and blue jeans. The car's hood is open, and the engine is exposed. The man is using a tool to work on the car.
+a serene night sky. Dominating the center of the frame is a full moon, its light piercing through the dark clouds that envelop it.
+a vibrant scene from a Mediterranean town. The focal point is a narrow cobblestone street that meanders between buildings painted in warm hues of yellow and orange.
+The video features a man with a mustache and a short haircut. He is wearing a brown jacket over a gray shirt. The man is looking to the side with a serious expression on his face.
+In the video, a woman with long blonde hair is seen sitting at a table adorned with a variety of colorful cakes and cupcakes. She is holding a knife in her hand, poised to cut into one of the cakes.
+The video features a man with a beard and a black shirt, smiling and looking away from the camera. He is in a room with a bookshelf in the background, filled with various books.
+The video features a woman with a short haircut and red lipstick, wearing large green earrings. She is standing in front of a backdrop with the words "Golden Globes" written on it.

@@ -63,6 +63,8 @@ latent_calibrator:
     use_frame_pos: true
     use_pooled_prompt: true
     use_anchor_latent: true
+    use_bridge_gate: false
+    use_log_snr: false
     input_mode: "concat_anchor_delta"
   residual:
     scale_mode: "clipped_snr"
@@ -95,6 +97,7 @@ video_adapters:
     use_temporal_conv2: true
     use_frame_conditioning: false
   resnet:
+    placement: "all"
     enabled: true
     active: true
     train: true
@@ -103,6 +106,16 @@ video_adapters:
     use_temporal_conv2: true
     use_frame_conditioning: true
   attention:
+    placement: "all"
+    anchor_conditioning:
+      enabled: false
+      mode: "spatial"
+      projector_hidden: 128
+      projector_share_by_resolution: true
+      gate_init: 0.0
+      gate_per_channel: false
+      train_anchor_attn: true
+      train_projector: true
     enabled: true
     active: true
     train: true
@@ -115,6 +128,7 @@ video_adapters:
     include_prompt_tokens: true
 
 training:
+  init_from_checkpoint: null
   output_dir: "outputs/sdxl-resnet-attention-sinusoidal-res512-bs5"
   train_batch_size: 5
   gradient_accumulation_steps: 4
@@ -149,6 +163,9 @@ training:
   image_first_boundary_snr: null
   image_first_boundary_lowfreq_only: true
   image_first_boundary_downsample_factor: 4
+  image_first_smooth_anchor_source: "clean_first_frame"
+  image_first_rollout_source_timestep: 600
+  image_first_rollout_source_steps: 4
   image_first_rollout_steps: 0
   image_first_rollout_noise_offset: 0.0
   image_first_rollout_switch_noise_scale: 0.0

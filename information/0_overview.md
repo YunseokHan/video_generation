@@ -103,6 +103,9 @@ adapters without replacing the pretrained SDXL backbone.
 - `information/12_vae_temporal_diagnostic.md`: A2 diagnostic that measures
   whether the frozen, frame-independent SDXL VAE introduces a binding
   flicker floor.
+- `information/13_ablation_eval.md`: quantitative multi-prompt paired
+  evaluation harness (the MVE) that ranks trained checkpoints and logs all
+  models to a single wandb run.
 - `information/claude-codex-discussion.md`: living log of the Claude–Codex
   critical methodology review (agendas A1–A3, U1–U3, roadmap, update protocol).
 

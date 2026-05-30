@@ -21,6 +21,7 @@ class VideoAttentionAdapterConfig:
     enabled: bool = False
     active: bool = True
     train: bool = True
+    placement: str = "all"
     use_temporal_self_attention: bool = True
     use_temporal_cross_attention: bool = True
     use_temporal_ffn: bool = True
@@ -28,14 +29,23 @@ class VideoAttentionAdapterConfig:
     temporal_ffn_kernel_size: int = 3
     temporal_ffn_gamma_init: float = 0.0
     include_prompt_tokens: bool = True
+    # Persistent anchor conditioning (Agenda A1 v1).
+    anchor_enabled: bool = False
+    anchor_mode: str = "spatial"
+    anchor_latent_channels: int = 4
+    anchor_projector_hidden: int = 128
+    anchor_gate_init: float = 0.0
+    anchor_gate_per_channel: bool = False
 
     @classmethod
     def from_config(cls, config: dict[str, Any] | None) -> "VideoAttentionAdapterConfig":
         values = dict(config or {})
+        anchor = dict(values.get("anchor_conditioning") or {})
         return cls(
             enabled=bool(values.get("enabled", cls.enabled)),
             active=bool(values.get("active", cls.active)),
             train=bool(values.get("train", cls.train)),
+            placement=str(values.get("placement", cls.placement) or cls.placement),
             use_temporal_self_attention=bool(
                 values.get("use_temporal_self_attention", cls.use_temporal_self_attention)
             ),
@@ -51,7 +61,32 @@ class VideoAttentionAdapterConfig:
                 values.get("temporal_ffn_gamma_init", cls.temporal_ffn_gamma_init)
             ),
             include_prompt_tokens=bool(values.get("include_prompt_tokens", cls.include_prompt_tokens)),
+            anchor_enabled=bool(anchor.get("enabled", cls.anchor_enabled)),
+            anchor_mode=str(anchor.get("mode", cls.anchor_mode) or cls.anchor_mode),
+            anchor_latent_channels=int(anchor.get("latent_channels", cls.anchor_latent_channels)),
+            anchor_projector_hidden=int(anchor.get("projector_hidden", cls.anchor_projector_hidden)),
+            anchor_gate_init=float(anchor.get("gate_init", cls.anchor_gate_init)),
+            anchor_gate_per_channel=bool(anchor.get("gate_per_channel", cls.anchor_gate_per_channel)),
         )
+
+
+def resolve_unet_placement_sections(placement: str | None) -> set[str] | None:
+    """Map a placement string to the set of top-level UNet sections to adapt.
+
+    Returns None when all sections should be adapted (the default), or a subset
+    of {"down", "mid", "up"}. Accepts forms like "all", "mid_up", "mid+up",
+    "up", "down_mid_up".
+    """
+    text = str(placement or "all").strip().lower()
+    if text in {"", "all", "downmidup", "down_mid_up", "down-mid-up"}:
+        return None
+    tokens = {tok for tok in text.replace("+", "_").replace("-", "_").split("_") if tok}
+    sections = {tok for tok in tokens if tok in {"down", "mid", "up"}}
+    if not sections:
+        raise ValueError(
+            f"Unrecognized placement {placement!r}; use 'all' or a combination of down/mid/up."
+        )
+    return sections
 
 
 def _zero_attention_output(attention: nn.Module) -> None:
@@ -76,6 +111,11 @@ class VideoBasicTransformerBlock(nn.Module):
         temporal_ffn_gamma_init: float = 0.0,
         include_prompt_tokens: bool = True,
         active: bool = True,
+        use_anchor_conditioning: bool = False,
+        anchor_latent_channels: int = 4,
+        anchor_projector_hidden: int = 128,
+        anchor_gate_init: float = 0.0,
+        anchor_gate_per_channel: bool = False,
     ) -> None:
         super().__init__()
         if Attention is None:
@@ -148,6 +188,28 @@ class VideoBasicTransformerBlock(nn.Module):
         nn.init.zeros_(self.temporal_ffn_out.weight)
         nn.init.zeros_(self.temporal_ffn_out.bias)
 
+        self.use_anchor_conditioning = bool(use_anchor_conditioning)
+        if self.use_anchor_conditioning:
+            self.anchor_proj_in = nn.Conv2d(int(anchor_latent_channels), int(anchor_projector_hidden), kernel_size=1)
+            self.anchor_proj_out = nn.Conv2d(int(anchor_projector_hidden), dim, kernel_size=1)
+            self.anchor_norm = nn.LayerNorm(dim)
+            self.anchor_attn = Attention(
+                query_dim=dim,
+                cross_attention_dim=dim,
+                heads=heads,
+                dim_head=dim_head,
+                bias=attention_bias,
+                out_bias=attention_out_bias,
+            )
+            # NOTE: do NOT zero-init anchor_attn output here. Identity at init is
+            # provided by the zero gate alone. If both the gate and the attn
+            # output were zero, the gate's gradient (upstream * anchor_out) would
+            # be zero and the branch could never open — a dead-branch deadlock.
+            if bool(anchor_gate_per_channel):
+                self.anchor_gate = nn.Parameter(torch.full((dim,), float(anchor_gate_init)))
+            else:
+                self.anchor_gate = nn.Parameter(torch.tensor(float(anchor_gate_init)))
+
         self.use_temporal_self_attention = bool(use_temporal_self_attention)
         self.use_temporal_cross_attention = bool(use_temporal_cross_attention)
         self.use_temporal_ffn = bool(use_temporal_ffn)
@@ -155,6 +217,7 @@ class VideoBasicTransformerBlock(nn.Module):
         self.active = bool(active)
         self.video_num_frames: int | None = None
         self.video_frame_tokens: torch.Tensor | None = None
+        self.video_anchor_latents: torch.Tensor | None = None
 
         # When a use_* flag is False the corresponding sub-module is still
         # instantiated (so state_dict layout stays compatible with checkpoints
@@ -199,6 +262,12 @@ class VideoBasicTransformerBlock(nn.Module):
             yield from self.temporal_ffn_conv.parameters()
             yield from self.temporal_ffn_out.parameters()
             yield self.temporal_ffn_gamma
+        if self.use_anchor_conditioning:
+            yield from self.anchor_proj_in.parameters()
+            yield from self.anchor_proj_out.parameters()
+            yield from self.anchor_norm.parameters()
+            yield from self.anchor_attn.parameters()
+            yield self.anchor_gate
 
     def set_chunk_feed_forward(self, chunk_size: int | None, dim: int = 0) -> None:
         self._chunk_size = chunk_size
@@ -208,13 +277,16 @@ class VideoBasicTransformerBlock(nn.Module):
         self,
         num_frames: int | None,
         frame_tokens: torch.Tensor | None = None,
+        anchor_latents: torch.Tensor | None = None,
     ) -> None:
         self.video_num_frames = int(num_frames) if num_frames is not None else None
         self.video_frame_tokens = frame_tokens
+        self.video_anchor_latents = anchor_latents
 
     def clear_video_context(self) -> None:
         self.video_num_frames = None
         self.video_frame_tokens = None
+        self.video_anchor_latents = None
 
     def _to_temporal_tokens(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, int, int]:
         num_frames = int(self.video_num_frames or 1)
@@ -328,6 +400,43 @@ class VideoBasicTransformerBlock(nn.Module):
         hidden_output = self._from_temporal_tokens(temporal_output, batch_size, spatial_tokens)
         return hidden_states + hidden_output
 
+    def _temporal_anchor_attention(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Spatial-aligned anchor conditioning (Agenda A1 v1).
+
+        At each spatial site the F frame tokens attend to a single anchor token
+        derived from the clean anchor latent projected to this block's grid.
+        Gated by a zero-init parameter so an enabled-but-untrained branch is an
+        exact identity (checkpoint-compatible).
+        """
+        if not self.active or not self.use_anchor_conditioning:
+            return hidden_states
+        if self.video_anchor_latents is None:
+            return hidden_states
+        norm_hidden_states = self.anchor_norm(hidden_states)
+        temporal, batch_size, spatial_tokens = self._to_temporal_tokens(norm_hidden_states)
+        side = int(round(spatial_tokens ** 0.5))
+        if side * side != spatial_tokens:
+            # Non-square spatial grid: spatial alignment is undefined, skip.
+            return hidden_states
+        anchor = self.video_anchor_latents.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        if anchor.ndim != 4:
+            return hidden_states
+        if anchor.shape[0] != batch_size:
+            if batch_size % anchor.shape[0] == 0:
+                anchor = anchor.repeat_interleave(batch_size // anchor.shape[0], dim=0)
+            else:
+                return hidden_states
+        anchor = torch_f.interpolate(anchor, size=(side, side), mode="bilinear", align_corners=False)
+        anchor = self.anchor_proj_out(torch_f.silu(self.anchor_proj_in(anchor)))
+        anchor_tokens = anchor.flatten(2).transpose(1, 2)  # [B, S, C]
+        kv = anchor_tokens.reshape(batch_size * spatial_tokens, 1, anchor_tokens.shape[-1])
+        anchor_output = self.anchor_attn(temporal, encoder_hidden_states=kv)
+        hidden_output = self._from_temporal_tokens(anchor_output, batch_size, spatial_tokens)
+        gate = self.anchor_gate.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        if gate.ndim == 1:
+            gate = gate.view(1, 1, -1)
+        return hidden_states + gate * hidden_output
+
     def _temporal_cross_attention(
         self,
         hidden_states: torch.Tensor,
@@ -429,6 +538,7 @@ class VideoBasicTransformerBlock(nn.Module):
             hidden_states = self.fuser(hidden_states, gligen_kwargs["objs"])
 
         hidden_states = self._temporal_self_attention(hidden_states)
+        hidden_states = self._temporal_anchor_attention(hidden_states)
 
         if self.attn2 is not None:
             if self.norm_type == "ada_norm":
@@ -488,6 +598,25 @@ def _target_module(module: nn.Module) -> nn.Module:
     return getattr(module, "module", module)
 
 
+def _placement_roots(module: nn.Module, sections: set[str] | None) -> list[nn.Module]:
+    """Return the subtrees to inject adapters into for a given placement.
+
+    None means the whole module (default). A subset of {down, mid, up} restricts
+    injection to those top-level UNet sections; sections absent on the module
+    (e.g. a VAE decoder has no down_blocks) are simply skipped.
+    """
+    if sections is None:
+        return [module]
+    roots: list[nn.Module] = []
+    if "down" in sections and getattr(module, "down_blocks", None) is not None:
+        roots.append(module.down_blocks)
+    if "mid" in sections and getattr(module, "mid_block", None) is not None:
+        roots.append(module.mid_block)
+    if "up" in sections and getattr(module, "up_blocks", None) is not None:
+        roots.append(module.up_blocks)
+    return roots
+
+
 def iter_video_attention_blocks(module: nn.Module) -> Iterator[VideoBasicTransformerBlock]:
     module = _target_module(module)
     for child in module.modules():
@@ -531,13 +660,20 @@ def inject_video_attention_adapters(
                         temporal_ffn_gamma_init=adapter_config.temporal_ffn_gamma_init,
                         include_prompt_tokens=adapter_config.include_prompt_tokens,
                         active=adapter_config.active,
+                        use_anchor_conditioning=adapter_config.anchor_enabled,
+                        anchor_latent_channels=adapter_config.anchor_latent_channels,
+                        anchor_projector_hidden=adapter_config.anchor_projector_hidden,
+                        anchor_gate_init=adapter_config.anchor_gate_init,
+                        anchor_gate_per_channel=adapter_config.anchor_gate_per_channel,
                     ),
                 )
                 replaced += 1
             else:
                 replace_children(child)
 
-    replace_children(module)
+    sections = resolve_unet_placement_sections(adapter_config.placement)
+    for root in _placement_roots(module, sections):
+        replace_children(root)
     return replaced
 
 
@@ -556,9 +692,14 @@ def set_video_attention_context(
     module: nn.Module,
     num_frames: int | None,
     frame_tokens: torch.Tensor | None = None,
+    anchor_latents: torch.Tensor | None = None,
 ) -> None:
     for block in iter_video_attention_blocks(module):
-        block.set_video_context(num_frames=num_frames, frame_tokens=frame_tokens)
+        block.set_video_context(
+            num_frames=num_frames,
+            frame_tokens=frame_tokens,
+            anchor_latents=anchor_latents,
+        )
 
 
 def clear_video_attention_context(module: nn.Module) -> None:
@@ -585,6 +726,15 @@ def sync_video_attention_adapter_device_dtype(module: nn.Module) -> None:
             device=reference.device,
             dtype=reference.dtype,
         )
+        if getattr(block, "use_anchor_conditioning", False):
+            block.anchor_proj_in.to(device=reference.device, dtype=reference.dtype)
+            block.anchor_proj_out.to(device=reference.device, dtype=reference.dtype)
+            block.anchor_norm.to(device=reference.device, dtype=reference.dtype)
+            block.anchor_attn.to(device=reference.device, dtype=reference.dtype)
+            block.anchor_gate.data = block.anchor_gate.data.to(
+                device=reference.device,
+                dtype=reference.dtype,
+            )
 
 
 def video_attention_adapter_state_dict(module: nn.Module) -> dict[str, torch.Tensor]:
@@ -598,11 +748,16 @@ def video_attention_adapter_state_dict(module: nn.Module) -> dict[str, torch.Ten
         ".temporal_ffn_in.",
         ".temporal_ffn_conv.",
         ".temporal_ffn_out.",
+        ".anchor_proj_in.",
+        ".anchor_proj_out.",
+        ".anchor_norm.",
+        ".anchor_attn.",
     )
+    adapter_suffixes = (".temporal_ffn_gamma", ".anchor_gate")
     return {
         key: value.detach().cpu()
         for key, value in module.state_dict().items()
-        if any(name in key for name in adapter_names) or key.endswith(".temporal_ffn_gamma")
+        if any(name in key for name in adapter_names) or key.endswith(adapter_suffixes)
     }
 
 
